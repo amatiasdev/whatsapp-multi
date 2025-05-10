@@ -1,0 +1,24 @@
+version: '3.8'
+
+services:
+  whatsapp-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: whatsapp-multi-session-api
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./storage:/app/storage
+      - ./logs:/app/logs
+    environment:
+      - PORT=3000
+      - HOST=0.0.0.0
+      - LOG_LEVEL=info
+    # Para evitar problemas con Puppeteer en contenedores
+    cap_add:
+      - SYS_ADMIN
+    # O alternativamente usar el modo inseguro (no recomendado para producción)
+    # security_opt:
+    #   - seccomp=unconfined
