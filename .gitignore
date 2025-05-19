@@ -4,6 +4,7 @@ node_modules/
 received-messages/
 .wwebjs_cache/
 sessions/
+qr-codes/
 
 # Logs
 logs/

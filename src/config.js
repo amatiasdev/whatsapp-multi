@@ -4,13 +4,13 @@ const path = require('path');
 module.exports = {
   // Servidor
   port: process.env.PORT || 3000,
-  
+  webPort : process.env.WEB_PORT || 3001,
   // WhatsApp
   sessionDataPath: process.env.SESSION_DATA_PATH || path.join(__dirname, '../sessions'),
   maxSessions: parseInt(process.env.MAX_SESSIONS || '30', 10),
   
   // Webhooks
-  n8nWebhookUrl: process.env.N8N_WEBHOOK_URL || 'http://localhost:5678/webhook/whatsapp-messages',
+  n8nWebhookUrl: process.env.BACKEND_WEBHOOK_URL || 'http://localhost:5678/webhook/whatsapp-messages',
   messageChunkSize: parseInt(process.env.MESSAGE_CHUNK_SIZE || '5', 10),
   chunkSendIntervalMs: parseInt(process.env.CHUNK_SEND_INTERVAL_MS || '30000', 10),
   messageFilters: {

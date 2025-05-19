@@ -256,9 +256,9 @@ async function sendMessageChunkForChat(chatId) {
   
   // Enviar al webhook
   try {
-    const webhookUrl = process.env.N8N_WEBHOOK_URL;
+    const webhookUrl = process.env.BACKEND_WEBHOOK_URL;
     if (!webhookUrl) {
-      throw new Error('N8N_WEBHOOK_URL no configurada en .env');
+      throw new Error('BACKEND_WEBHOOK_URL no configurada en .env');
     }
     
     const response = await axios.post(webhookUrl, payload, {

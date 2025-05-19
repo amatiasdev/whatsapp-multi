@@ -10,14 +10,19 @@ const socketIo = require('socket.io');
 const path = require('path');
 const qrcode = require('qrcode');
 const fs = require('fs');
+const axios = require('axios');
+const logger = require('./src/utils/logger');
+
+// Importar el servicio QR
+const qrService = require('./src/services/qrService');
+
+// URL base del API principal
+const API_BASE_URL = process.env.API_BASE_URL || 'http://localhost:3000/api';
 
 // Inicializar Express
 const app = express();
 const server = http.createServer(app);
 const io = socketIo(server);
-
-// Importar el servicio QR
-const qrService = require('./src/services/qrService');
 
 // Configurar carpeta de archivos estáticos
 app.use(express.static(path.join(__dirname, 'src', 'public')));
@@ -33,13 +38,56 @@ app.get('/qr/:sessionId', (req, res) => {
   res.sendFile(path.join(__dirname, 'src', 'public', 'qr.html'));
 });
 
+// Endpoint API para obtener el estado de conexión (proxy al servidor principal)
+app.get('/api/session/:sessionId/connection-status', async (req, res) => {
+  try {
+    const sessionId = req.params.sessionId;
+    
+    // Intentar obtener desde el servidor principal
+    try {
+      const response = await axios.get(`${API_BASE_URL}/session/${sessionId}/connection-status`);
+      return res.status(response.status).json(response.data);
+    } catch (apiError) {
+      logger.warn(`Error al obtener estado desde API: ${apiError.message}`);
+      
+      // Si no se puede conectar al API, usar información local
+      const qrData = qrService.getQR(sessionId);
+      const isConnected = qrService.isSessionConnected(sessionId);
+      
+      let connectionStatus = 'disconnected';
+      if (isConnected) {
+        connectionStatus = 'connected';
+      } else if (qrData) {
+        connectionStatus = 'waiting_for_scan';
+      }
+      
+      return res.status(200).json({
+        success: true,
+        sessionId,
+        connectionStatus,
+        details: {
+          exists: true,
+          isConnected,
+          hasQR: !!qrData
+        }
+      });
+    }
+  } catch (error) {
+    logger.error(`Error al procesar solicitud de estado: ${error.message}`);
+    res.status(500).json({
+      success: false,
+      error: 'Error interno del servidor'
+    });
+  }
+});
+
 // Manejar conexiones de Socket.IO
 io.on('connection', (socket) => {
-  console.log('Nuevo cliente web conectado');
+  logger.info('Nuevo cliente web conectado');
   
   // Cuando el cliente solicita un QR específico
   socket.on('requestQR', (sessionId) => {
-    console.log(`Cliente solicitó QR para sesión: ${sessionId}`);
+    logger.debug(`Cliente solicitó QR para sesión: ${sessionId}`);
     
     const qrData = qrService.getQR(sessionId);
     
@@ -47,7 +95,7 @@ io.on('connection', (socket) => {
       // Convertir el código QR a URL de imagen
       qrcode.toDataURL(qrData.qr, (err, url) => {
         if (err) {
-          console.error('Error al generar QR para web:', err);
+          logger.error('Error al generar QR para web:', err);
           socket.emit('qrStatus', { 
             sessionId,
             status: 'error',
@@ -108,8 +156,9 @@ setInterval(() => {
     }
   });
 }, CHECK_INTERVAL);
+
 // Puerto para el servidor web
 const PORT = process.env.QR_WEB_PORT || 3001;
 server.listen(PORT, () => {
-  console.log(`Servidor web para QR iniciado en el puerto ${PORT}`);
+  logger.info(`Servidor web para QR iniciado en el puerto ${PORT}`);
 });

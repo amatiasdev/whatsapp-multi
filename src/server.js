@@ -1,11 +1,19 @@
 const express = require('express');
+const http = require('http'); // Add this import
 const config = require('./config');
 const logger = require('./utils/logger');
 const sessionController = require('./controllers/sessionController');
 const whatsappService = require('./services/whatsappService');
+const socketService = require('./services/socketService'); // Import socket service
 
 // Crear aplicación Express
 const app = express();
+
+// Crear servidor HTTP a partir de la app Express
+const server = http.createServer(app); // Add this line
+
+// Inicializar servicio de Socket.IO con el servidor HTTP
+socketService.initialize(server); // Initialize socket service
 
 // Middleware para parsear JSON
 app.use(express.json());
@@ -66,7 +74,9 @@ app.post('/api/session/start-listening', sessionController.startListening);
 app.post('/api/session/stop-listening', sessionController.stopListening);
 app.get('/api/session/:sessionId/status', sessionController.getSessionStatus);
 app.get('/api/sessions', sessionController.getAllSessions);
+app.get('/session/:sessionId/connection-status', sessionController.checkConnectionStatus);
 app.delete('/api/session/:sessionId', sessionController.cleanupSession);
+
 
 // Middleware para manejo de errores
 app.use((err, req, res, next) => {
@@ -77,9 +87,9 @@ app.use((err, req, res, next) => {
   });
 });
 
-// Iniciar el servidor
+// Iniciar el servidor usando el server HTTP, no la app Express
 const PORT = config.port;
-app.listen(PORT, () => {
+server.listen(PORT, () => { // Change this line from app.listen to server.listen
   logger.info(`Servidor escuchando en el puerto ${PORT}`);
   logger.info(`Configuración cargada: Max Sessions=${config.maxSessions}, Chunk Size=${config.messageChunkSize}, Chunk Interval=${config.chunkSendIntervalMs}ms`);
 });

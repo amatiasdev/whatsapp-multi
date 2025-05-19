@@ -4,8 +4,9 @@
   "description": "Backend para escuchar mensajes de WhatsApp y enviarlos en chunks a n8n",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js",
-    "dev": "nodemon index.js"
+    "start": "node src/server.js",
+    "dev": "nodemon src/server.js",
+    "qrweb": "node qrWebServer.js"
   },
   "keywords": [
     "whatsapp",
@@ -19,7 +20,9 @@
     "axios": "^1.6.2",
     "dotenv": "^16.3.1",
     "express": "^4.18.2",
+    "qrcode": "^1.5.4",
     "qrcode-terminal": "^0.12.0",
+    "socket.io": "^4.8.1",
     "whatsapp-web.js": "^1.23.0",
     "winston": "^3.11.0"
   },

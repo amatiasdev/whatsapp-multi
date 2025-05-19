@@ -250,5 +250,5 @@ app.listen(PORT, () => {
   
   console.log(`\n💾 Los mensajes recibidos se guardarán en: ${messagesDir}`);
   console.log(`\n🖼️ Los medios recibidos se guardarán en: ${mediaDir}`);
-  console.log(`\n📢 Listo para recibir mensajes de WhatsApp. Configura N8N_WEBHOOK_URL=http://localhost:${PORT}/webhook/whatsapp-messages en tu .env\n`);
+  console.log(`\n📢 Listo para recibir mensajes de WhatsApp. Configura BACKEND_WEBHOOK_URL=http://localhost:${PORT}/webhook/whatsapp-messages en tu .env\n`);
 });

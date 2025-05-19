@@ -7,7 +7,7 @@ const config = require('../config');
 const webhookService = require('./webhookService');
 const mediaHandler = require('./whatsappMediaHandler');
 const contactsManager = require('./contactsManager');
-
+const qrService = require('./qrService');
 class WhatsAppService {
   constructor() {
     this.clients = new Map(); // Map de clientId -> { client, isListening, messageBuffer }
@@ -79,18 +79,38 @@ class WhatsAppService {
     // Manejar la generación de código QR
     client.on('qr', (qr) => {
       logger.info(`Código QR generado para la sesión ${sessionId}`);
-      qrcode.generate(qr, { small: true });
-      // Aquí podrías implementar la lógica para enviar el QR a través de Socket.IO
+      
+      // Guardar QR en el servicio (esto también lo emitirá por socket)
+      qrService.saveQR(sessionId, qr);
+      
+      logger.info(`QR Code guardado y disponible para interfaz web`);
     });
 
     // Manejar conexión exitosa
-    client.on('ready', () => {
-      logger.info(`Cliente WhatsApp listo para la sesión ${sessionId}`);
+    client.on('ready', async () => {
+      logger.info(`Cliente WhatsApp listo y conectado para la sesión ${sessionId}`);
+      
+      // Marcar sesión como conectada en el servicio QR (esto también lo emitirá por socket)
+      qrService.markSessionConnected(sessionId);
+      
+      try {
+        // Iniciar escucha
+        const listenResult = await this.startListening(sessionId);
+        logger.info(`Escucha iniciada automáticamente para sesión ${sessionId}: ${JSON.stringify(listenResult)}`);
+      } catch (error) {
+        logger.error(`Error al iniciar escucha automática para sesión ${sessionId}: ${error.message}`);
+      }
     });
 
     // Manejar desconexión
     client.on('disconnected', (reason) => {
       logger.warn(`Cliente WhatsApp desconectado para la sesión ${sessionId}: ${reason}`);
+      
+      // Si tienes markSessionDisconnected, úsalo
+      if (typeof qrService.markSessionDisconnected === 'function') {
+        qrService.markSessionDisconnected(sessionId);
+      }
+      
       this.cleanupSession(sessionId);
     });
 
@@ -377,13 +397,10 @@ class WhatsAppService {
       if (!sessionExists) {
         initResult = await this.initializeClient(sessionId);
       }
-      
-      // Iniciar escucha inmediatamente
-      const listenResult = await this.startListening(sessionId);
-      
+
       return {
         initialization: initResult,
-        listening: listenResult
+        status: 'initializing'
       };
     } catch (error) {
       logger.error('Error en initializeAndListen:', error);

@@ -28,24 +28,46 @@ class SessionController {
 
   async startListening(req, res) {
     try {
-      const { sessionId } = req.body;
-
-      if (!sessionId) {
-        return res.status(400).json({ success: false, error: 'Se requiere sessionId' });
+      const { sessionId = 'default' } = req.body;
+      
+      logger.info(`POST /api/session/start-listening`);
+      
+      // Verificar si la sesión ya existe
+      const sessionExists = await whatsappService.checkSessionExists(sessionId);
+      
+      // Si la sesión existe y ya está conectada, solo iniciamos escucha
+      if (sessionExists) {
+        const status = await whatsappService.getSessionStatus(sessionId);
+        
+        if (status.isConnected) {
+          // La sesión ya existe y está conectada, podemos iniciar escucha directamente
+          const listenResult = await whatsappService.startListening(sessionId);
+          return res.status(200).json({
+            success: true,
+            sessionId,
+            status: 'connected',
+            listening: listenResult
+          });
+        }
       }
-
-      // Usar el método combinado
+      
+      // Si llegamos aquí, necesitamos inicializar o reconectar
       const result = await whatsappService.initializeAndListen(sessionId);
-      logger.info(`Inicialización y escucha: ${JSON.stringify(result)}`);
-
-      return res.status(200).json({
+      
+      // Respuesta más precisa sobre el estado real
+      res.status(200).json({
         success: true,
-        ...result
+        sessionId,
+        status: 'initializing',
+        message: sessionExists 
+          ? "Reconectando sesión existente, escanee el código QR" 
+          : "Iniciando nueva sesión, escanee el código QR",
+        initialization: result.initialization
       });
-
+      
     } catch (error) {
-      logger.error('Error al inicializar e iniciar escucha:', error);
-      return res.status(500).json({
+      logger.error(`Error al iniciar sesión: ${error.message}`);
+      res.status(500).json({
         success: false,
         error: error.message
       });
@@ -135,6 +157,49 @@ class SessionController {
       });
     }
   }
+
+  async checkConnectionStatus (req, res) {
+    try {
+      const { sessionId = 'default' } = req.params;
+      
+      logger.debug(`GET /api/session/${sessionId}/connection-status`);
+      
+      const status = await whatsappService.getSessionStatus(sessionId);
+      
+      // Determinar estado detallado
+      let connectionStatus = 'disconnected';
+      
+      if (status.exists) {
+        if (status.isConnected) {
+          connectionStatus = 'connected';
+          if (status.isListening) {
+            connectionStatus = 'listening';
+          }
+        } else {
+          connectionStatus = 'initializing';
+          // Comprobar si hay un QR disponible
+          const qrAvailable = await qrService.getQR(sessionId) !== null;
+          if (qrAvailable) {
+            connectionStatus = 'waiting_for_scan';
+          }
+        }
+      }
+      
+      res.status(200).json({
+        success: true,
+        sessionId,
+        connectionStatus,
+        details: status
+      });
+      
+    } catch (error) {
+      logger.error(`Error al obtener estado de conexión: ${error.message}`);
+      res.status(500).json({
+        success: false,
+        error: error.message
+      });
+    }
+  };
 }
 
 module.exports = new SessionController();

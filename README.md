@@ -38,7 +38,7 @@ npm install
 3. Crear un archivo `.env` (opcional):
 
 ```
-PORT=3000
+PORT=3001
 HOST=localhost
 LOG_LEVEL=info
 ```
