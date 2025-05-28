@@ -58,3 +58,5 @@ pids/
 # Misc
 *.tgz
 *.bak
+
+latest-qr.txt
