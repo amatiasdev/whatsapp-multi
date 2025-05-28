@@ -59,7 +59,9 @@ class WhatsAppService {
   };
   }
 
-  async initializeClient(sessionId) {
+  async initializeClient(sessionId, options = {}) {
+    const { fromDisk = false } = options;
+
     // Validar límites antes de crear
     const validation = await this.validateSessionCreation(sessionId);
     if (!validation.allowed) {
@@ -68,6 +70,10 @@ class WhatsAppService {
 
     // Verificar si ya existe una sesión con este ID
     if (this.clients.has(sessionId)) {
+      if (fromDisk) {
+        logger.info(`📦 Sesión ${sessionId} restaurada desde disco. Se evita reinicialización.`);
+        return { status: 'restored_from_disk', clientId: sessionId };
+      }
       const existingSession = this.clients.get(sessionId);
       
       // Si ya tiene cliente y está conectado, retornar información
@@ -163,7 +169,13 @@ class WhatsAppService {
     // Manejar conexión exitosa
     client.on('ready', async () => {
       logger.info(`Cliente WhatsApp listo y conectado para la sesión ${sessionId}`);
-      
+
+      const session = this.clients.get(sessionId);
+      if (session) {
+        session.isConnected = true;
+        session.readyAt = new Date();
+      }
+
       session.lastActivity = Date.now();
       session.reconnectionAttempts = 0; // Reset contador en conexión exitosa
       
@@ -296,11 +308,14 @@ class WhatsAppService {
     return { status: 'listening_started' };
   }
 
-  stopListening(sessionId) {
+  async stopListening(sessionId) {
     const session = this.clients.get(sessionId);
     if (!session) {
       throw new Error(`Sesión ${sessionId} no encontrada`);
     }
+
+    // ✅ Siempre enviar resumen antes de hacer cualquier limpieza
+    await this.sendStopListeningCommand(sessionId);
 
     if (!session.isListening) {
       logger.info(`La sesión ${sessionId} no está en modo escucha`);
@@ -309,10 +324,7 @@ class WhatsAppService {
 
     // Remover el manejador de mensajes
     session.client.removeAllListeners('message');
-    
-    // Enviar los mensajes restantes en el buffer
-    this.sendStopListeningCommand(sessionId);
-    
+
     // Limpiar los timers existentes
     Object.keys(session.chunkTimers).forEach(chatId => {
       if (session.chunkTimers[chatId]) {
@@ -320,17 +332,17 @@ class WhatsAppService {
         delete session.chunkTimers[chatId];
       }
     });
-    
+
     // Limpiar el buffer de mensajes
     session.messageBuffer = {};
-    
+
     // Marcar como no escuchando
     session.isListening = false;
     logger.info(`Modo escucha desactivado para la sesión ${sessionId}`);
-    
+
     // Emitir estado por socket
     socketService.emitListeningStatus(sessionId, false);
-    
+
     return { status: 'listening_stopped' };
   }
 
@@ -679,18 +691,20 @@ class WhatsAppService {
   }
 
   async getSessionStatus(sessionId) {
-    const session = this.clients.get(sessionId);
-    if (!session) {
-      return { exists: false };
+    const client = this.clients.get(sessionId);
+
+    if (!client) {
+      return {
+        exists: false,
+        isConnected: false,
+        isListening: false
+      };
     }
 
     return {
       exists: true,
-      isListening: session.isListening,
-      isConnected: session.client?.info ? true : false,
-      bufferSize: Object.keys(session.messageBuffer).reduce(
-        (total, chatId) => total + session.messageBuffer[chatId].length, 0
-      )
+      isConnected: client.isConnected || false,
+      isListening: client.isListening || false
     };
   }
 
@@ -990,6 +1004,7 @@ class WhatsAppService {
   }
     // ===== NUEVO MÉTODO 1 =====
   async sendStopListeningCommand(sessionId) {
+    logger.info(`A PUNTO DE ENVIAR  ${sessionId}`);
     const session = this.clients.get(sessionId);
     if (!session) {
       logger.warn(`No se puede enviar comando de resumen: sesión ${sessionId} no encontrada`);
@@ -998,15 +1013,43 @@ class WhatsAppService {
 
     try {
       // Obtener todos los chats que tienen mensajes en buffer
-      const chatsWithMessages = Object.keys(session.messageBuffer).filter(
-        chatId => session.messageBuffer[chatId] && session.messageBuffer[chatId].length > 0
-      );
+      const allChats = Object.keys(session.messageBuffer);
 
       logger.info(`Enviando comando de resumen para ${chatsWithMessages.length} chats en sesión ${sessionId}`);
 
       // Enviar comando de resumen para cada chat que tiene mensajes
-      for (const chatId of chatsWithMessages) {
-        await this.sendSummaryCommandForChat(sessionId, chatId);
+      for (const chatId of allChats) {
+        // Si hay mensajes en el buffer, se envían con el comando
+        // Si no hay mensajes, se envía el comando solo
+        if (!session.messageBuffer[chatId]) {
+          session.messageBuffer[chatId] = [];
+        }
+
+        const lastMessage = session.messageBuffer[chatId].slice(-1)[0];
+
+        const commandMessage = {
+          id: `stop_command_${Date.now()}`,
+          from: chatId,
+          to: session.client.info?.wid?._serialized || 'unknown',
+          body: 'GIVE_ME_SUMMARY_N8N',
+          timestamp: Math.floor(Date.now() / 1000),
+          hasMedia: false,
+          type: 'chat',
+          isForwarded: false,
+          isStatus: false,
+          isGroupMessage: lastMessage?.isGroupMessage || false,
+          sessionId: sessionId,
+          contact: lastMessage?.contact || null,
+          group: lastMessage?.group || null,
+          contactName: lastMessage?.contactName || 'Sistema',
+          authorName: lastMessage?.authorName || null,
+          authorContact: lastMessage?.authorContact || null
+        };
+
+        session.messageBuffer[chatId].push(commandMessage);
+
+        await this.sendMessageChunk(sessionId, chatId);
+        logger.info(`Comando de resumen enviado para chat ${chatId} en sesión ${sessionId}`);
       }
 
     } catch (error) {
@@ -1014,6 +1057,8 @@ class WhatsAppService {
         errorMessage: error.message,
         sessionId
       });
+    }finally{
+      logger.info(`SE TERMINO EL METODO  sendStopListeningCommand PARA LA SESION ${sessionId}`);
     }
   }
 

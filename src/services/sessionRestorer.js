@@ -11,7 +11,7 @@ async function restoreSessionsOnStart() {
 
     for (const entry of folders) {
       if (entry.isDirectory()) {
-        const sessionId = entry.name;
+        const sessionId = entry.name.replace(/^session-/, '');
         logger.info(`🔄 Restaurando sesión desde disco: ${sessionId}`);
 
         try {
