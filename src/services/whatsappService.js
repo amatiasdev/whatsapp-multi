@@ -11,6 +11,8 @@ const qrService = require('./qrService');
 const chatService = require('./whatsappChatService');
 const socketService = require('./socketService');
 class WhatsAppService {
+
+
   constructor() {
     this.clients = new Map(); // Map de clientId -> { client, isListening, messageBuffer }
     this.ensureSessionDirectory();
@@ -30,27 +32,86 @@ class WhatsAppService {
     }
   }
 
+ async validateSessionCreation(sessionId) {
+  // Verificar límite global
+  if (this.clients.size >= config.maxSessions) {
+    return {
+      allowed: false,
+      reason: 'system_limit_reached',
+      maxSessions: config.maxSessions,
+      currentSessions: this.clients.size
+    };
+  }
+  
+  // Usar la validación del config para sessionId
+  const sessionIdValidation = config.validateSessionId(sessionId);
+  if (!sessionIdValidation.valid) {
+    return {
+      allowed: false,
+      reason: sessionIdValidation.reason
+    };
+  }
+  
+  return {
+    allowed: true,
+    currentSessions: this.clients.size,
+    maxSessions: config.maxSessions
+  };
+  }
+
   async initializeClient(sessionId) {
-    if (this.clients.size >= config.maxSessions) {
-      throw new Error(`Límite de sesiones alcanzado (${config.maxSessions})`);
+    // Validar límites antes de crear
+    const validation = await this.validateSessionCreation(sessionId);
+    if (!validation.allowed) {
+      throw new Error(`No se puede crear sesión: ${validation.reason}. ${validation.maxSessions ? `Límite: ${validation.maxSessions}` : ''}`);
     }
 
     // Verificar si ya existe una sesión con este ID
     if (this.clients.has(sessionId)) {
-      logger.info(`La sesión ${sessionId} ya está inicializada`);
-      return { 
-        status: 'already_initialized',
-        clientId: sessionId
-      };
+      const existingSession = this.clients.get(sessionId);
+      
+      // Si ya tiene cliente y está conectado, retornar información
+      if (existingSession.client) {
+        try {
+          const state = await existingSession.client.getState();
+          if (state === 'CONNECTED') {
+            logger.info(`La sesión ${sessionId} ya está inicializada y conectada`);
+            this.updateSessionActivity(sessionId);
+            return { 
+              status: 'already_connected',
+              clientId: sessionId,
+              state: state
+            };
+          }
+        } catch (error) {
+          logger.warn(`Error al verificar estado de sesión existente ${sessionId}: ${error.message}`);
+          // Continuar con reinicialización
+        }
+      }
+      
+      logger.info(`Reinicializando sesión existente ${sessionId}`);
+      // Limpiar cliente anterior si existe
+      if (existingSession.client) {
+        try {
+          await this.destroyClient(sessionId);
+        } catch (error) {
+          logger.warn(`Error al limpiar cliente anterior ${sessionId}: ${error.message}`);
+        }
+      }
+    } else {
+      // Nueva sesión, crear estructura
+      this.clients.set(sessionId, {
+        client: null,
+        isListening: false,
+        messageBuffer: {},
+        chunkTimers: {},
+        createdAt: Date.now(),
+        lastActivity: Date.now(),
+        reconnectionAttempts: 0
+      });
     }
 
-    // Crear directorio específico para esta sesión si no existe
-    const sessionDir = path.join(config.sessionDataPath, sessionId);
-    if (!fs.existsSync(sessionDir)) {
-      fs.mkdirSync(sessionDir, { recursive: true });
-    }
-
-    // Crear cliente de WhatsApp
+    // Crear cliente de WhatsApp con configuración mejorada
     const client = new Client({
       authStrategy: new LocalAuth({ 
         clientId: sessionId,
@@ -65,65 +126,146 @@ class WhatsAppService {
           '--disable-accelerated-2d-canvas',
           '--no-first-run',
           '--no-zygote',
-          '--disable-gpu'
-        ]
+          '--disable-gpu',
+          '--disable-background-timer-throttling',
+          '--disable-backgrounding-occluded-windows',
+          '--disable-renderer-backgrounding',
+          '--disable-features=TranslateUI',
+          '--disable-ipc-flooding-protection'
+        ],
+        timeout: config.clientTimeout || 45000
       }
     });
 
-    // Configurar la sesión en nuestro mapa
-    this.clients.set(sessionId, {
-      client,
-      isListening: false,
-      messageBuffer: {},  // Objeto donde las claves son chatIds y los valores son arrays de mensajes
-      chunkTimers: {}     // Timers para enviar chunks por chatId
-    });
+    // Actualizar referencia del cliente en la sesión
+    const session = this.clients.get(sessionId);
+    session.client = client;
+    session.lastActivity = Date.now();
 
     // Manejar la generación de código QR
     client.on('qr', (qr) => {
       logger.info(`Código QR generado para la sesión ${sessionId}`);
+      session.lastActivity = Date.now();
       
-      // Guardar QR en el servicio (esto también lo emitirá por socket)
+      // Guardar QR en el servicio
       qrService.saveQR(sessionId, qr);
       
       logger.info(`QR Code guardado y disponible para interfaz web`);
+    });
+
+    // Manejar eventos de autenticación
+    client.on('authenticated', () => {
+      logger.info(`Cliente autenticado para sesión ${sessionId}`);
+      session.lastActivity = Date.now();
+      session.reconnectionAttempts = 0; // Reset contador en autenticación exitosa
     });
 
     // Manejar conexión exitosa
     client.on('ready', async () => {
       logger.info(`Cliente WhatsApp listo y conectado para la sesión ${sessionId}`);
       
+      session.lastActivity = Date.now();
+      session.reconnectionAttempts = 0; // Reset contador en conexión exitosa
+      
       // Marcar sesión como conectada en el servicio QR
       qrService.markSessionConnected(sessionId);
       
-      // NO iniciar escucha automáticamente aquí
-      // El backend principal lo hará cuando sea necesario
-      logger.info(`Sesión ${sessionId} lista para recibir comandos de escucha`);
+      // Emitir evento de conexión exitosa
+      socketService.markSessionConnected(sessionId);
+      
+      logger.info(`Sesión ${sessionId} lista para recibir comandos`);
     });
 
-    // Manejar desconexión
+    // Manejar cambios de estado
+    client.on('change_state', (state) => {
+      logger.debug(`Cambio de estado para sesión ${sessionId}: ${state}`);
+      session.lastActivity = Date.now();
+      
+      // Emitir cambio de estado por socket
+      socketService.emitSessionStatus(sessionId, 'state_change', { state });
+    });
+
+    // Manejar errores de autenticación
+    client.on('auth_failure', (message) => {
+      logger.error(`Fallo de autenticación en sesión ${sessionId}: ${message}`);
+      session.reconnectionAttempts = (session.reconnectionAttempts || 0) + 1;
+      
+      // Emitir error por socket
+      socketService.emitSessionStatus(sessionId, 'auth_failure', { 
+        message,
+        attempts: session.reconnectionAttempts 
+      });
+    });
+
+    // Manejar desconexión con lógica mejorada
     client.on('disconnected', (reason) => {
       logger.warn(`Cliente WhatsApp desconectado para la sesión ${sessionId}: ${reason}`);
       
-      // Si tienes markSessionDisconnected, úsalo
+      session.lastActivity = Date.now();
+      session.lastDisconnectionReason = reason;
+      
+      // Marcar como desconectado en servicios
       if (typeof qrService.markSessionDisconnected === 'function') {
         qrService.markSessionDisconnected(sessionId);
       }
+      socketService.markSessionDisconnected(sessionId);
       
-      this.cleanupSession(sessionId);
+      // Intentar reconexión automática para ciertos tipos de desconexión
+      this.handleAutomaticReconnection(sessionId, reason);
     });
 
-    // Inicializar el cliente
+    // Manejar errores del cliente
+    client.on('error', (error) => {
+      logger.error(`Error en cliente WhatsApp para sesión ${sessionId}:`, {
+        errorMessage: error.message,
+        stack: error.stack
+      });
+      
+      session.lastActivity = Date.now();
+      
+      // Emitir error por socket
+      socketService.emitSessionStatus(sessionId, 'client_error', { 
+        error: error.message 
+      });
+    });
+
+    // Inicializar el cliente con timeout y retry
     try {
-      await client.initialize();
-      logger.info(`Cliente WhatsApp inicializado para la sesión ${sessionId}`);
+      logger.info(`Inicializando cliente WhatsApp para la sesión ${sessionId}`);
+      
+      // Usar Promise.race para timeout personalizado
+      await Promise.race([
+        client.initialize(),
+        new Promise((_, reject) => 
+          setTimeout(() => reject(new Error('Timeout en inicialización')), config.clientTimeout || 45000)
+        )
+      ]);
+      
+      logger.info(`Cliente WhatsApp inicializado correctamente para la sesión ${sessionId}`);
+      
       return { 
         status: 'initialized',
-        clientId: sessionId
+        clientId: sessionId,
+        message: 'Cliente inicializado, esperando QR o conexión automática'
       };
+      
     } catch (error) {
-      logger.error(`Error al inicializar el cliente WhatsApp para la sesión ${sessionId}:`, error);
+      logger.error(`Error al inicializar el cliente WhatsApp para la sesión ${sessionId}:`, {
+        errorMessage: error.message,
+        stack: error.stack
+      });
+      
+      // Limpiar en caso de error
       this.cleanupSession(sessionId);
-      throw error;
+      
+      // Determinar tipo de error y respuesta apropiada
+      if (error.message.includes('Timeout')) {
+        throw new Error(`Timeout al inicializar la sesión. Intente nuevamente.`);
+      } else if (error.message.includes('Target closed')) {
+        throw new Error(`Error de navegador. El servicio puede estar sobrecargado.`);
+      } else {
+        throw new Error(`Error al inicializar: ${error.message}`);
+      }
     }
   }
 
@@ -923,6 +1065,356 @@ class WhatsAppService {
       });
     }
   }
+
+      /**
+   * Reconecta una sesión existente
+   * @param {string} sessionId - ID de la sesión a reconectar
+   * @returns {Promise<Object>} - Resultado de la reconexión
+   */
+  async reconnectSession(sessionId) {
+    const session = this.clients.get(sessionId);
+    if (!session) {
+      throw new Error(`Sesión ${sessionId} no encontrada para reconectar`);
+    }
+
+    try {
+      logger.info(`Iniciando reconexión para sesión ${sessionId}`);
+      
+      // Actualizar timestamp de actividad
+      this.updateSessionActivity(sessionId);
+      
+      // Si el cliente ya existe pero está desconectado
+      if (session.client) {
+        const state = await session.client.getState();
+        logger.debug(`Estado actual del cliente ${sessionId}: ${state}`);
+        
+        if (state === 'CONNECTED') {
+          return {
+            status: 'already_connected',
+            message: 'La sesión ya está conectada'
+          };
+        }
+        
+        // Si está en un estado problemático, destruir y recrear
+        if (state === 'CONFLICT' || state === 'DEPRECATED_VERSION') {
+          logger.warn(`Estado problemático detectado (${state}), recreando cliente para sesión ${sessionId}`);
+          await this.destroyClient(sessionId);
+          return await this.initializeClient(sessionId);
+        }
+        
+        // Para otros estados, intentar reconectar
+        if (state === 'UNPAIRED' || state === 'UNPAIRED_IDLE') {
+          logger.info(`Cliente desvinculado, necesita nuevo QR para sesión ${sessionId}`);
+          // El cliente generará un nuevo QR automáticamente
+          return {
+            status: 'qr_required',
+            message: 'Se necesita escanear un nuevo código QR'
+          };
+        }
+      }
+      
+      // Si llegamos aquí, intentar inicialización normal
+      return await this.initializeClient(sessionId);
+      
+    } catch (error) {
+      logger.error(`Error durante reconexión de sesión ${sessionId}:`, {
+        errorMessage: error.message,
+        stack: error.stack
+      });
+      
+      // En caso de error, limpiar y reinicializar
+      try {
+        await this.destroyClient(sessionId);
+        return await this.initializeClient(sessionId);
+      } catch (reinitError) {
+        logger.error(`Error durante reinicialización de sesión ${sessionId}:`, {
+          errorMessage: reinitError.message
+        });
+        throw new Error(`No se pudo reconectar la sesión: ${reinitError.message}`);
+      }
+    }
+  }
+
+  /**
+   * Destruye un cliente específico sin eliminar la sesión del mapa
+   * @param {string} sessionId - ID de la sesión
+   */
+  async destroyClient(sessionId) {
+    const session = this.clients.get(sessionId);
+    if (!session || !session.client) {
+      return;
+    }
+
+    try {
+      logger.info(`Destruyendo cliente para sesión ${sessionId}`);
+      
+      // Detener escucha si está activa
+      if (session.isListening) {
+        session.client.removeAllListeners('message');
+        session.isListening = false;
+      }
+      
+      // Limpiar timers
+      Object.keys(session.chunkTimers || {}).forEach(chatId => {
+        if (session.chunkTimers[chatId]) {
+          clearTimeout(session.chunkTimers[chatId]);
+          delete session.chunkTimers[chatId];
+        }
+      });
+      
+      // Destruir cliente
+      await session.client.destroy();
+      
+      // Mantener la estructura de sesión pero limpiar el cliente
+      session.client = null;
+      session.lastActivity = Date.now();
+      session.reconnectionAttempts = (session.reconnectionAttempts || 0) + 1;
+      
+      logger.info(`Cliente destruido para sesión ${sessionId}`);
+      
+    } catch (error) {
+      logger.error(`Error al destruir cliente para sesión ${sessionId}:`, {
+        errorMessage: error.message
+      });
+    }
+  }
+
+  /**
+   * Actualiza el timestamp de última actividad de una sesión
+   * @param {string} sessionId - ID de la sesión
+   */
+  updateSessionActivity(sessionId) {
+    const session = this.clients.get(sessionId);
+    if (session) {
+      session.lastActivity = Date.now();
+      logger.debug(`Actividad actualizada para sesión ${sessionId}`);
+    }
+  }
+
+  /**
+   * Limpia sesiones expiradas y libera recursos
+   * @param {boolean} force - Si true, fuerza la limpieza incluso de sesiones activas
+   * @returns {Promise<Object>} - Resultado de la limpieza
+   */
+  async cleanupExpiredSessions(force = false) {
+    const now = Date.now();
+    const expiredThreshold = 24 * 60 * 60 * 1000; // 24 horas
+    const inactiveThreshold = 2 * 60 * 60 * 1000;  // 2 horas para marcar como inactiva
+    
+    const results = {
+      totalSessions: this.clients.size,
+      expiredSessions: [],
+      inactiveSessions: [],
+      cleanedSessions: [],
+      errors: []
+    };
+
+    logger.info(`Iniciando limpieza de sesiones (force: ${force})`);
+
+    for (const [sessionId, session] of this.clients.entries()) {
+      try {
+        const lastActivity = session.lastActivity || session.createdAt || 0;
+        const timeSinceActivity = now - lastActivity;
+        
+        // Marcar sesiones inactivas
+        if (timeSinceActivity > inactiveThreshold) {
+          results.inactiveSessions.push({
+            sessionId,
+            lastActivity: new Date(lastActivity),
+            timeSinceActivity: Math.round(timeSinceActivity / 1000 / 60) // minutos
+          });
+        }
+        
+        // Identificar sesiones expiradas
+        const shouldCleanup = force || 
+          timeSinceActivity > expiredThreshold ||
+          (session.reconnectionAttempts && session.reconnectionAttempts > 5) ||
+          (!session.client && timeSinceActivity > inactiveThreshold);
+        
+        if (shouldCleanup) {
+          results.expiredSessions.push({
+            sessionId,
+            reason: force ? 'forced' : 
+                    timeSinceActivity > expiredThreshold ? 'expired' :
+                    session.reconnectionAttempts > 5 ? 'too_many_retries' : 'inactive_no_client',
+            lastActivity: new Date(lastActivity),
+            reconnectionAttempts: session.reconnectionAttempts || 0
+          });
+          
+          // Limpiar la sesión
+          try {
+            await this.cleanupSession(sessionId);
+            results.cleanedSessions.push(sessionId);
+            logger.info(`Sesión expirada limpiada: ${sessionId}`);
+          } catch (cleanupError) {
+            results.errors.push({
+              sessionId,
+              error: cleanupError.message
+            });
+            logger.error(`Error al limpiar sesión expirada ${sessionId}:`, {
+              errorMessage: cleanupError.message
+            });
+          }
+        }
+        
+      } catch (error) {
+        results.errors.push({
+          sessionId,
+          error: error.message
+        });
+        logger.error(`Error al evaluar sesión para limpieza ${sessionId}:`, {
+          errorMessage: error.message
+        });
+      }
+    }
+
+    logger.info(`Limpieza completada. Sesiones limpiadas: ${results.cleanedSessions.length}`);
+    return results;
+  }
+
+  /**
+   * Obtiene estadísticas detalladas de las sesiones
+   * @returns {Promise<Object>} - Estadísticas completas
+   */
+  async getSessionsStatistics() {
+    const now = Date.now();
+    const stats = {
+      total: this.clients.size,
+      connected: 0,
+      listening: 0,
+      inactive: 0,
+      hasErrors: 0,
+      totalBufferSize: 0,
+      totalActiveTimers: 0,
+      sessionDetails: [],
+      limits: {
+        maxSessions: config.maxSessions,
+        usagePercentage: Math.round((this.clients.size / config.maxSessions) * 100)
+      }
+    };
+
+    for (const [sessionId, session] of this.clients.entries()) {
+      try {
+        const sessionInfo = await this.getSessionInfo(sessionId);
+        
+        // Contadores generales
+        if (sessionInfo.isConnected) stats.connected++;
+        if (sessionInfo.isListening) stats.listening++;
+        
+        const lastActivity = session.lastActivity || session.createdAt || 0;
+        const timeSinceActivity = now - lastActivity;
+        
+        if (timeSinceActivity > 2 * 60 * 60 * 1000) { // 2 horas
+          stats.inactive++;
+        }
+        
+        if (session.reconnectionAttempts && session.reconnectionAttempts > 0) {
+          stats.hasErrors++;
+        }
+        
+        stats.totalBufferSize += sessionInfo.totalBufferSize || 0;
+        stats.totalActiveTimers += sessionInfo.activeTimers || 0;
+        
+        // Detalles de sesión
+        stats.sessionDetails.push({
+          sessionId,
+          isConnected: sessionInfo.isConnected,
+          isListening: sessionInfo.isListening,
+          bufferSize: sessionInfo.totalBufferSize || 0,
+          activeTimers: sessionInfo.activeTimers || 0,
+          lastActivity: new Date(lastActivity),
+          timeSinceActivity: Math.round(timeSinceActivity / 1000 / 60), // minutos
+          reconnectionAttempts: session.reconnectionAttempts || 0,
+          socketConnections: sessionInfo.socketConnections || 0
+        });
+        
+      } catch (error) {
+        logger.error(`Error al obtener estadísticas para sesión ${sessionId}:`, {
+          errorMessage: error.message
+        });
+        
+        stats.sessionDetails.push({
+          sessionId,
+          error: error.message,
+          lastActivity: new Date(session.lastActivity || 0)
+        });
+      }
+    }
+
+    // Ordenar por última actividad (más reciente primero)
+    stats.sessionDetails.sort((a, b) => {
+      const aTime = a.lastActivity ? a.lastActivity.getTime() : 0;
+      const bTime = b.lastActivity ? b.lastActivity.getTime() : 0;
+      return bTime - aTime;
+    });
+
+    return stats;
+  }
+
+  /**
+   * Implementa reconexión automática para sesiones desconectadas
+   * @param {string} sessionId - ID de la sesión
+   * @param {string} reason - Razón de la desconexión
+   */
+  async handleAutomaticReconnection(sessionId, reason) {
+    const session = this.clients.get(sessionId);
+    if (!session) return;
+
+    // Actualizar contador de intentos de reconexión
+    session.reconnectionAttempts = (session.reconnectionAttempts || 0) + 1;
+    session.lastDisconnection = Date.now();
+    session.lastDisconnectionReason = reason;
+
+    logger.info(`Analizando desconexión de sesión ${sessionId}`, {
+      reason,
+      attempts: session.reconnectionAttempts
+    });
+
+    // Razones que NO requieren reconexión automática
+    const permanentDisconnections = [
+      'LOGOUT',
+      'BANNED',
+      'DEPRECATED_VERSION',
+      'USER_LOGOUT'
+    ];
+
+    if (permanentDisconnections.includes(reason)) {
+      logger.info(`Desconexión permanente detectada para sesión ${sessionId}: ${reason}`);
+      return;
+    }
+
+    // Límite de intentos de reconexión
+    if (session.reconnectionAttempts > 5) {
+      logger.warn(`Demasiados intentos de reconexión para sesión ${sessionId}, marcando como problemática`);
+      return;
+    }
+
+    // Razones que indican problemas temporales de red
+    const temporaryDisconnections = [
+      'NAVIGATION',
+      'CONFLICT_RESTART',
+      'CONNECTION_MAIN_SYNC_NOT_CONNECTED',
+      'Lost connection with WhatsApp'
+    ];
+
+    if (temporaryDisconnections.some(temp => reason.includes(temp))) {
+      const delayMs = Math.min(5000 * session.reconnectionAttempts, 30000); // Backoff exponencial hasta 30s
+      
+      logger.info(`Programando reconexión automática para sesión ${sessionId} en ${delayMs}ms`);
+      
+      setTimeout(async () => {
+        try {
+          await this.reconnectSession(sessionId);
+          logger.info(`Reconexión automática iniciada para sesión ${sessionId}`);
+        } catch (error) {
+          logger.error(`Error en reconexión automática para sesión ${sessionId}:`, {
+            errorMessage: error.message
+          });
+        }
+      }, delayMs);
+    }
+  }
+  
 }
 
 module.exports = new WhatsAppService();

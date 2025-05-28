@@ -235,6 +235,129 @@ class SessionController {
       });
     }
   }
+
+    /**
+   * Reconecta una sesión existente sin crear una nueva instancia
+   */
+  async reconnectSession(req, res) {
+    try {
+      const { sessionId } = req.params;
+      
+      if (!sessionId) {
+        return res.status(400).json({ 
+          success: false, 
+          error: 'Se requiere sessionId' 
+        });
+      }
+      
+      logger.info(`Iniciando reconexión para sesión ${sessionId}`);
+      
+      // Verificar que la sesión existe
+      const sessionExists = await whatsappService.checkSessionExists(sessionId);
+      if (!sessionExists) {
+        return res.status(404).json({
+          success: false,
+          error: `Sesión ${sessionId} no encontrada`
+        });
+      }
+      
+      // Obtener estado actual de la sesión
+      const currentStatus = await whatsappService.getSessionStatus(sessionId);
+      
+      // Si ya está conectada, no hacer nada
+      if (currentStatus.isConnected) {
+        return res.status(200).json({
+          success: true,
+          sessionId,
+          status: 'already_connected',
+          message: 'La sesión ya está conectada',
+          details: currentStatus
+        });
+      }
+      
+      // Intentar reconexión
+      const reconnectResult = await whatsappService.reconnectSession(sessionId);
+      
+      logger.info(`Reconexión iniciada para sesión ${sessionId}`, { reconnectResult });
+      
+      return res.status(200).json({
+        success: true,
+        sessionId,
+        status: 'reconnecting',
+        message: 'Proceso de reconexión iniciado. Escanee el código QR si aparece.',
+        ...reconnectResult
+      });
+      
+    } catch (error) {
+      logger.error('Error al reconectar sesión:', {
+        errorMessage: error.message,
+        stack: error.stack,
+        sessionId: req.params?.sessionId
+      });
+      
+      return res.status(500).json({
+        success: false,
+        error: error.message,
+        sessionId: req.params?.sessionId
+      });
+    }
+  }
+
+  /**
+   * Limpia sesiones expiradas y optimiza recursos
+   */
+  async cleanupExpiredSessions(req, res) {
+    try {
+      const { force = false } = req.query;
+      
+      logger.info('Iniciando limpieza de sesiones expiradas', { force });
+      
+      const cleanupResult = await whatsappService.cleanupExpiredSessions(force);
+      
+      return res.status(200).json({
+        success: true,
+        message: 'Limpieza de sesiones completada',
+        ...cleanupResult
+      });
+      
+    } catch (error) {
+      logger.error('Error al limpiar sesiones expiradas:', {
+        errorMessage: error.message,
+        stack: error.stack
+      });
+      
+      return res.status(500).json({
+        success: false,
+        error: error.message
+      });
+    }
+  }
+
+  /**
+   * Obtiene estadísticas detalladas de las sesiones
+   */
+  async getSessionsStats(req, res) {
+    try {
+      const stats = await whatsappService.getSessionsStatistics();
+      
+      return res.status(200).json({
+        success: true,
+        stats,
+        timestamp: Date.now()
+      });
+      
+    } catch (error) {
+      logger.error('Error al obtener estadísticas de sesiones:', {
+        errorMessage: error.message,
+        stack: error.stack
+      });
+      
+      return res.status(500).json({
+        success: false,
+        error: error.message
+      });
+    }
+  }
 }
 
 module.exports = new SessionController();

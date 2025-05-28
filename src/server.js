@@ -5,6 +5,10 @@ const logger = require('./utils/logger');
 const sessionController = require('./controllers/sessionController');
 const whatsappService = require('./services/whatsappService');
 const socketService = require('./services/socketService');
+const SessionLifecycleManager = require('./services/sessionLifecycleManager');
+const lifecycleManager = new SessionLifecycleManager(whatsappService);
+const restoreSessionsOnStart = require('./services/sessionRestorer');
+
 
 // Validar configuración al inicio (si existe el método validate)
 try {
@@ -26,6 +30,8 @@ const server = http.createServer(app);
 // Inicializar servicio de Socket.IO con el servidor HTTP
 socketService.initialize(server);
 logger.info('Servicio de Socket.IO inicializado');
+
+restoreSessionsOnStart();
 
 // Middleware para parsear JSON con límite aumentado
 app.use(express.json({ limit: '50mb' }));
@@ -391,6 +397,251 @@ app.get('/api/sessions/:sessionId/info', async (req, res) => {
   }
 });
 
+
+/**
+ * @route POST /api/sessions/:sessionId/reconnect
+ * @description Reconecta una sesión existente sin crear nueva instancia
+ */
+app.post('/api/sessions/:sessionId/reconnect', sessionController.reconnectSession);
+
+/**
+ * @route POST /api/sessions/cleanup
+ * @description Limpia sesiones expiradas manualmente
+ */
+app.post('/api/sessions/cleanup', sessionController.cleanupExpiredSessions);
+
+/**
+ * @route GET /api/sessions/stats
+ * @description Obtiene estadísticas detalladas del sistema de sesiones
+ */
+app.get('/api/sessions/stats', sessionController.getSessionsStats);
+
+/**
+ * @route GET /api/sessions/health
+ * @description Obtiene estado de salud del sistema de sesiones
+ */
+app.get('/api/sessions/health', async (req, res) => {
+  try {
+    // Obtener estadísticas básicas
+    const stats = await whatsappService.getSessionsStatistics();
+    
+    // Identificar sesiones problemáticas
+    const problematicSessions = await lifecycleManager.identifyProblematicSessions();
+    
+    // Obtener estadísticas de uso por usuario
+    const userStats = lifecycleManager.getUserUsageStats();
+    
+    // Calcular estado general de salud
+    const healthScore = calculateSystemHealthScore(stats, problematicSessions);
+    
+    const healthReport = {
+      overallHealth: healthScore,
+      timestamp: Date.now(),
+      summary: {
+        totalSessions: stats.total,
+        connectedSessions: stats.connected,
+        listeningSessions: stats.listening,
+        problematicSessions: problematicSessions.length,
+        systemUsage: `${stats.limits.usagePercentage}%`
+      },
+      details: {
+        sessionStats: stats,
+        problematicSessions: problematicSessions.slice(0, 10), // Top 10 problemas
+        userUsage: userStats
+      },
+      recommendations: generateHealthRecommendations(stats, problematicSessions)
+    };
+    
+    return res.json({
+      success: true,
+      health: healthReport
+    });
+    
+  } catch (error) {
+    logger.error('Error al obtener estado de salud:', {
+      errorMessage: error.message,
+      stack: error.stack
+    });
+    
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+/**
+ * @route POST /api/sessions/:sessionId/validate
+ * @description Valida si una sesión puede ser creada
+ */
+app.post('/api/sessions/:sessionId/validate', async (req, res) => {
+  try {
+    const { sessionId } = req.params;
+    const { userId } = req.body; // Opcional
+    
+    if (!sessionId || sessionId.trim() === '') {
+      return res.status(400).json({
+        success: false,
+        error: 'sessionId es requerido'
+      });
+    }
+    
+    const validation = await lifecycleManager.validateSessionCreation(userId, sessionId);
+    
+    return res.json({
+      success: true,
+      validation,
+      sessionId
+    });
+    
+  } catch (error) {
+    logger.error('Error al validar sesión:', {
+      errorMessage: error.message,
+      sessionId: req.params?.sessionId
+    });
+    
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+/**
+ * @route GET /api/sessions/problematic
+ * @description Obtiene lista de sesiones problemáticas que necesitan atención
+ */
+app.get('/api/sessions/problematic', async (req, res) => {
+  try {
+    const { limit = '20', severity = '0' } = req.query;
+    
+    const problematicSessions = await lifecycleManager.identifyProblematicSessions();
+    
+    // Filtrar por severidad si se especifica
+    let filtered = problematicSessions;
+    if (parseInt(severity) > 0) {
+      filtered = problematicSessions.filter(session => session.severity >= parseInt(severity));
+    }
+    
+    // Limitar resultados
+    const limited = filtered.slice(0, parseInt(limit));
+    
+    return res.json({
+      success: true,
+      problematicSessions: limited,
+      total: problematicSessions.length,
+      filtered: filtered.length,
+      returned: limited.length,
+      timestamp: Date.now()
+    });
+    
+  } catch (error) {
+    logger.error('Error al obtener sesiones problemáticas:', {
+      errorMessage: error.message
+    });
+    
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+/**
+ * @route POST /api/sessions/bulk-action
+ * @description Ejecuta acciones en lote sobre múltiples sesiones
+ */
+app.post('/api/sessions/bulk-action', async (req, res) => {
+  try {
+    const { action, sessionIds, options = {} } = req.body;
+    
+    if (!action || !sessionIds || !Array.isArray(sessionIds)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Se requieren action y sessionIds (array)'
+      });
+    }
+    
+    const allowedActions = ['cleanup', 'reconnect', 'stop-listening', 'start-listening'];
+    if (!allowedActions.includes(action)) {
+      return res.status(400).json({
+        success: false,
+        error: `Acción no válida. Permitidas: ${allowedActions.join(', ')}`
+      });
+    }
+    
+    logger.info(`Ejecutando acción en lote: ${action} en ${sessionIds.length} sesiones`);
+    
+    const results = {
+      action,
+      totalSessions: sessionIds.length,
+      successful: [],
+      failed: [],
+      timestamp: Date.now()
+    };
+    
+    // Ejecutar acción en cada sesión
+    for (const sessionId of sessionIds) {
+      try {
+        let result;
+        
+        switch (action) {
+          case 'cleanup':
+            await whatsappService.cleanupSession(sessionId);
+            result = { status: 'cleaned' };
+            break;
+            
+          case 'reconnect':
+            result = await whatsappService.reconnectSession(sessionId);
+            break;
+            
+          case 'stop-listening':
+            result = whatsappService.stopListening(sessionId);
+            break;
+            
+          case 'start-listening':
+            result = whatsappService.startListening(sessionId);
+            break;
+        }
+        
+        results.successful.push({
+          sessionId,
+          result
+        });
+        
+      } catch (error) {
+        results.failed.push({
+          sessionId,
+          error: error.message
+        });
+        
+        logger.error(`Error en acción ${action} para sesión ${sessionId}:`, {
+          errorMessage: error.message
+        });
+      }
+    }
+    
+    logger.info(`Acción en lote completada: ${results.successful.length} exitosas, ${results.failed.length} fallidas`);
+    
+    return res.json({
+      success: true,
+      results
+    });
+    
+  } catch (error) {
+    logger.error('Error en acción en lote:', {
+      errorMessage: error.message,
+      action: req.body?.action
+    });
+    
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+
 // Middleware para rutas no encontradas
 app.use('*', (req, res) => {
   res.status(404).json({
@@ -427,6 +678,9 @@ async function gracefulShutdown(signal) {
   logger.info(`Señal ${signal} recibida, cerrando servidor...`);
   
   try {
+    // Detener el lifecycle manager
+    lifecycleManager.destroy();
+    
     // Obtener todas las sesiones activas
     const sessions = await whatsappService.getAllSessions();
     
@@ -504,3 +758,84 @@ process.on('unhandledRejection', (reason, promise) => {
     process.exit(1);
   }
 });
+
+/**
+ * Calcula un puntaje de salud del sistema (0-100)
+ */
+function calculateSystemHealthScore(stats, problematicSessions) {
+  let score = 100;
+  
+  // Penalizar por uso alto del sistema
+  if (stats.limits.usagePercentage > 90) {
+    score -= 20;
+  } else if (stats.limits.usagePercentage > 70) {
+    score -= 10;
+  }
+  
+  // Penalizar por sesiones desconectadas
+  const disconnectedRatio = (stats.total - stats.connected) / stats.total;
+  score -= Math.round(disconnectedRatio * 30);
+  
+  // Penalizar por sesiones problemáticas
+  const problematicRatio = problematicSessions.length / stats.total;
+  score -= Math.round(problematicRatio * 40);
+  
+  // Penalizar por sesiones inactivas
+  score -= Math.round((stats.inactive / stats.total) * 20);
+  
+  return Math.max(0, Math.min(100, score));
+}
+
+/**
+ * Genera recomendaciones basadas en el estado del sistema
+ */
+function generateHealthRecommendations(stats, problematicSessions) {
+  const recommendations = [];
+  
+  if (stats.limits.usagePercentage > 85) {
+    recommendations.push({
+      priority: 'high',
+      type: 'capacity',
+      message: 'El sistema está cerca de su límite de sesiones. Considere aumentar MAX_SESSIONS o limpiar sesiones inactivas.',
+      action: 'increase_capacity_or_cleanup'
+    });
+  }
+  
+  if (problematicSessions.length > stats.total * 0.2) {
+    recommendations.push({
+      priority: 'medium',
+      type: 'maintenance',
+      message: `${problematicSessions.length} sesiones necesitan atención. Ejecute limpieza o reconexión.`,
+      action: 'cleanup_problematic_sessions'
+    });
+  }
+  
+  if (stats.inactive > stats.total * 0.3) {
+    recommendations.push({
+      priority: 'medium',
+      type: 'optimization',
+      message: 'Muchas sesiones están inactivas. Considere ejecutar limpieza automática.',
+      action: 'cleanup_inactive_sessions'
+    });
+  }
+  
+  if (stats.connected < stats.total * 0.7) {
+    recommendations.push({
+      priority: 'high',
+      type: 'connectivity',
+      message: 'Muchas sesiones están desconectadas. Verifique conectividad o ejecute reconexión masiva.',
+      action: 'bulk_reconnect'
+    });
+  }
+  
+  if (stats.totalBufferSize > 500) {
+    recommendations.push({
+      priority: 'low',
+      type: 'performance',
+      message: 'Los buffers de mensajes están acumulando datos. Verifique webhooks.',
+      action: 'check_webhook_health'
+    });
+  }
+  
+  return recommendations;
+}
