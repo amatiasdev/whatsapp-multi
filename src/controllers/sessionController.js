@@ -1,4 +1,5 @@
 const whatsappService = require('../services/whatsappService');
+const qrService = require('../services/qrService');
 const logger = require('../utils/logger');
 
 class SessionController {
@@ -11,14 +12,18 @@ class SessionController {
       }
       
       const result = await whatsappService.initializeClient(sessionId);
-      logger.info(`Inicialización de sesión: ${JSON.stringify(result)}`);
+      logger.info(`Inicialización de sesión: ${sessionId}`, { result });
       
       return res.status(200).json({ 
         success: true, 
         ...result
       });
     } catch (error) {
-      logger.error('Error al inicializar sesión:', error);
+      logger.error('Error al inicializar sesión:', {
+        errorMessage: error.message,
+        stack: error.stack,
+        sessionId: req.body?.sessionId
+      });
       return res.status(500).json({ 
         success: false, 
         error: error.message 
@@ -30,7 +35,7 @@ class SessionController {
     try {
       const { sessionId = 'default' } = req.body;
       
-      logger.info(`POST /api/session/start-listening`);
+      logger.debug(`Iniciando escucha para sesión: ${sessionId}`);
       
       // Verificar si la sesión ya existe
       const sessionExists = await whatsappService.checkSessionExists(sessionId);
@@ -66,7 +71,11 @@ class SessionController {
       });
       
     } catch (error) {
-      logger.error(`Error al iniciar sesión: ${error.message}`);
+      logger.error(`Error al iniciar sesión:`, {
+        errorMessage: error.message,
+        stack: error.stack,
+        sessionId: req.body?.sessionId
+      });
       res.status(500).json({
         success: false,
         error: error.message
@@ -83,14 +92,18 @@ class SessionController {
       }
       
       const result = whatsappService.stopListening(sessionId);
-      logger.info(`Detención de escucha: ${JSON.stringify(result)}`);
+      logger.info(`Detención de escucha para sesión: ${sessionId}`, { result });
       
       return res.status(200).json({ 
         success: true, 
         ...result
       });
     } catch (error) {
-      logger.error('Error al detener escucha:', error);
+      logger.error('Error al detener escucha:', {
+        errorMessage: error.message,
+        stack: error.stack,
+        sessionId: req.body?.sessionId
+      });
       return res.status(500).json({ 
         success: false, 
         error: error.message 
@@ -112,7 +125,11 @@ class SessionController {
         status
       });
     } catch (error) {
-      logger.error('Error al obtener estado de sesión:', error);
+      logger.error('Error al obtener estado de sesión:', {
+        errorMessage: error.message,
+        stack: error.stack,
+        sessionId: req.params?.sessionId
+      });
       return res.status(500).json({ 
         success: false, 
         error: error.message 
@@ -128,7 +145,10 @@ class SessionController {
         sessions
       });
     } catch (error) {
-      logger.error('Error al obtener todas las sesiones:', error);
+      logger.error('Error al obtener todas las sesiones:', {
+        errorMessage: error.message,
+        stack: error.stack
+      });
       return res.status(500).json({ 
         success: false, 
         error: error.message 
@@ -150,7 +170,11 @@ class SessionController {
         message: `Sesión ${sessionId} eliminada correctamente`
       });
     } catch (error) {
-      logger.error('Error al eliminar sesión:', error);
+      logger.error('Error al eliminar sesión:', {
+        errorMessage: error.message,
+        stack: error.stack,
+        sessionId: req.params?.sessionId
+      });
       return res.status(500).json({ 
         success: false, 
         error: error.message 
@@ -158,11 +182,11 @@ class SessionController {
     }
   }
 
-  async checkConnectionStatus (req, res) {
+  async checkConnectionStatus(req, res) {
     try {
       const { sessionId = 'default' } = req.params;
       
-      logger.debug(`GET /api/session/${sessionId}/connection-status`);
+      logger.debug(`Verificando estado de conexión para sesión: ${sessionId}`);
       
       const status = await whatsappService.getSessionStatus(sessionId);
       
@@ -177,10 +201,17 @@ class SessionController {
           }
         } else {
           connectionStatus = 'initializing';
+          
           // Comprobar si hay un QR disponible
-          const qrAvailable = await qrService.getQR(sessionId) !== null;
-          if (qrAvailable) {
-            connectionStatus = 'waiting_for_scan';
+          try {
+            const qrData = await qrService.getQR(sessionId);
+            if (qrData && qrData.qr) {
+              connectionStatus = 'waiting_for_scan';
+            }
+          } catch (qrError) {
+            logger.debug(`No se pudo obtener QR para sesión ${sessionId}:`, {
+              errorMessage: qrError.message
+            });
           }
         }
       }
@@ -193,13 +224,17 @@ class SessionController {
       });
       
     } catch (error) {
-      logger.error(`Error al obtener estado de conexión: ${error.message}`);
+      logger.error(`Error al obtener estado de conexión:`, {
+        errorMessage: error.message,
+        stack: error.stack,
+        sessionId: req.params?.sessionId
+      });
       res.status(500).json({
         success: false,
         error: error.message
       });
     }
-  };
+  }
 }
 
 module.exports = new SessionController();

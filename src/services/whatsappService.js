@@ -8,6 +8,8 @@ const webhookService = require('./webhookService');
 const mediaHandler = require('./whatsappMediaHandler');
 const contactsManager = require('./contactsManager');
 const qrService = require('./qrService');
+const chatService = require('./whatsappChatService');
+const socketService = require('./socketService');
 class WhatsAppService {
   constructor() {
     this.clients = new Map(); // Map de clientId -> { client, isListening, messageBuffer }
@@ -90,16 +92,12 @@ class WhatsAppService {
     client.on('ready', async () => {
       logger.info(`Cliente WhatsApp listo y conectado para la sesión ${sessionId}`);
       
-      // Marcar sesión como conectada en el servicio QR (esto también lo emitirá por socket)
+      // Marcar sesión como conectada en el servicio QR
       qrService.markSessionConnected(sessionId);
       
-      try {
-        // Iniciar escucha
-        const listenResult = await this.startListening(sessionId);
-        logger.info(`Escucha iniciada automáticamente para sesión ${sessionId}: ${JSON.stringify(listenResult)}`);
-      } catch (error) {
-        logger.error(`Error al iniciar escucha automática para sesión ${sessionId}: ${error.message}`);
-      }
+      // NO iniciar escucha automáticamente aquí
+      // El backend principal lo hará cuando sea necesario
+      logger.info(`Sesión ${sessionId} lista para recibir comandos de escucha`);
     });
 
     // Manejar desconexión
@@ -140,12 +138,18 @@ class WhatsAppService {
       return { status: 'already_listening' };
     }
 
+    // Remover listeners anteriores para evitar duplicados
+    session.client.removeAllListeners('message');
+    
     // Configurar el manejador de mensajes
     session.client.on('message', (message) => this.handleMessage(sessionId, message));
     
     // Marcar como escuchando
     session.isListening = true;
     logger.info(`Modo escucha activado para la sesión ${sessionId}`);
+    
+    // Emitir estado por socket
+    socketService.emitListeningStatus(sessionId, true);
     
     return { status: 'listening_started' };
   }
@@ -165,7 +169,7 @@ class WhatsAppService {
     session.client.removeAllListeners('message');
     
     // Enviar los mensajes restantes en el buffer
-    this.sendRemainingMessages(sessionId);
+    this.sendStopListeningCommand(sessionId);
     
     // Limpiar los timers existentes
     Object.keys(session.chunkTimers).forEach(chatId => {
@@ -182,18 +186,32 @@ class WhatsAppService {
     session.isListening = false;
     logger.info(`Modo escucha desactivado para la sesión ${sessionId}`);
     
+    // Emitir estado por socket
+    socketService.emitListeningStatus(sessionId, false);
+    
     return { status: 'listening_stopped' };
   }
+
 
   async handleMessage(sessionId, message) {
     const session = this.clients.get(sessionId);
     if (!session || !session.isListening) return;
-  
+
     try {
       // Extraer información relevante del mensaje
       const chatId = message.from;
       const isGroupMessage = chatId.endsWith('@g.us');
       const isBroadcast = chatId === 'status@broadcast' || message.isStatus;
+      
+      // Verificar configuración de escucha para este chat específico
+      // Si existe chatFilters y este chat está marcado como no escuchar, ignorarlo
+      if (session.chatFilters && session.chatFilters.has(chatId)) {
+        const isListeningToChat = session.chatFilters.get(chatId);
+        if (!isListeningToChat) {
+          logger.debug(`Ignorando mensaje de ${chatId} en sesión ${sessionId} (configurado para no escuchar este chat)`);
+          return;
+        }
+      }
       
       // Aplicar filtros configurados
       const filters = config.messageFilters;
@@ -248,7 +266,7 @@ class WhatsAppService {
         isGroupMessage,
         sessionId
       };
-  
+
       // Agregar metadatos adicionales si están disponibles
       if (message.author) messageData.author = message.author;
       if (message.deviceType) messageData.deviceType = message.deviceType;
@@ -326,7 +344,7 @@ class WhatsAppService {
       }
       session.messageBuffer[chatId].push(messageData);
       logger.debug(`Mensaje agregado al buffer para chatId ${chatId} en sesión ${sessionId}`);
-  
+
       // Si llegamos al tamaño del chunk, enviar inmediatamente
       if (session.messageBuffer[chatId].length >= config.messageChunkSize) {
         this.sendMessageChunk(sessionId, chatId);
@@ -338,7 +356,12 @@ class WhatsAppService {
         }, config.chunkSendIntervalMs);
       }
     } catch (error) {
-      logger.error(`Error al procesar mensaje en sesión ${sessionId}:`, error);
+      logger.error(`Error al procesar mensaje en sesión ${sessionId}:`, {
+        errorMessage: error.message,
+        sessionId,
+        messageId: message?.id?._serialized || 'unknown',
+        chatId: message?.from || 'unknown'
+      });
     }
   }
 
@@ -372,7 +395,14 @@ class WhatsAppService {
       });
       logger.info(`Chunk de ${messages.length} mensajes enviado a n8n para chatId ${chatId} en sesión ${sessionId}`);
     } catch (error) {
-      logger.error(`Error al enviar chunk de mensajes a n8n para chatId ${chatId} en sesión ${sessionId}:`, error);
+      // NO pasar el objeto error completo al logger para evitar referencias circulares
+      logger.error(`Error al enviar chunk de mensajes a n8n para chatId ${chatId} en sesión ${sessionId}:`, {
+        errorMessage: error.message,
+        chatId,
+        sessionId,
+        messageCount: messages.length
+      });
+      
       // Reintegrar mensajes al buffer en caso de error
       if (!session.messageBuffer[chatId]) {
         session.messageBuffer[chatId] = [];
@@ -422,7 +452,10 @@ class WhatsAppService {
 
   async cleanupSession(sessionId) {
     const session = this.clients.get(sessionId);
-    if (!session) return;
+    if (!session) {
+      logger.warn(`Intentando limpiar sesión inexistente: ${sessionId}`);
+      return;
+    }
 
     try {
       // Detener la escucha si está activa
@@ -434,13 +467,73 @@ class WhatsAppService {
       if (session.client) {
         await session.client.destroy();
       }
+      
+      // Limpiar caché de chats
+      chatService.clearCache(sessionId);
+      
+      // Marcar sesión como desconectada en sockets
+      socketService.markSessionDisconnected(sessionId);
+      
     } catch (error) {
-      logger.error(`Error al limpiar la sesión ${sessionId}:`, error);
+      logger.error(`Error al limpiar la sesión ${sessionId}:`, {
+        errorMessage: error.message,
+        sessionId,
+        stack: error.stack
+      });
     } finally {
       // Eliminar del mapa de clientes
       this.clients.delete(sessionId);
       logger.info(`Sesión ${sessionId} eliminada`);
     }
+  }
+
+  async getSessionInfo(sessionId) {
+    const session = this.clients.get(sessionId);
+    if (!session) {
+      return { 
+        exists: false,
+        sessionId 
+      };
+    }
+
+    let clientInfo = null;
+    try {
+      if (session.client && session.client.info) {
+        const info = session.client.info;
+        clientInfo = {
+          wid: info.wid?.user || null,
+          phone: info.wid?._serialized || null,
+          pushname: info.pushname || null,
+          platform: info.platform || null,
+          battery: info.battery || null,
+          plugged: info.plugged || false
+        };
+      }
+    } catch (error) {
+      logger.debug(`No se pudo obtener info del cliente para sesión ${sessionId}: ${error.message}`);
+    }
+
+    const bufferStats = {};
+    let totalBufferSize = 0;
+    
+    Object.keys(session.messageBuffer).forEach(chatId => {
+      const size = session.messageBuffer[chatId].length;
+      bufferStats[chatId] = size;
+      totalBufferSize += size;
+    });
+
+    return {
+      exists: true,
+      sessionId,
+      isListening: session.isListening,
+      isConnected: session.client?.info ? true : false,
+      totalBufferSize,
+      bufferStats,
+      activeTimers: Object.keys(session.chunkTimers).length,
+      clientInfo,
+      socketConnections: socketService.getConnectionCount(sessionId),
+      chatFiltersCount: session.chatFilters ? session.chatFilters.size : 0
+    };
   }
 
   async getSessionStatus(sessionId) {
@@ -472,6 +565,363 @@ class WhatsAppService {
       });
     }
     return sessions;
+  }
+
+    /**
+   * Obtiene la lista de chats para una sesión específica
+   * @param {string} sessionId - ID de la sesión
+   * @param {boolean} forceRefresh - Si debe forzar actualización
+   * @param {number} limit - Límite de chats a devolver (default: 50)
+   * @param {number} offset - Offset para paginación (default: 0)
+   * @returns {Object} Lista de chats con información básica
+   */
+  async getSessionChats(sessionId, forceRefresh = false, limit = 50, offset = 0) {
+    try {
+      logger.info(`Obteniendo chats para sesión ${sessionId} (limit: ${limit}, offset: ${offset}, refresh: ${forceRefresh})`);
+      
+      // Verificar que la sesión existe
+      const session = this.clients.get(sessionId);
+      if (!session || !session.client) {
+        throw new Error(`Sesión ${sessionId} no encontrada o no inicializada`);
+      }
+
+      const client = session.client;
+      
+      // Verificar que el cliente esté conectado
+      const state = await client.getState();
+      if (state !== 'CONNECTED') {
+        throw new Error(`Cliente WhatsApp no está conectado. Estado actual: ${state}`);
+      }
+
+      // Obtener todos los chats
+      const allChats = await client.getChats();
+      const totalChats = allChats.length;
+      
+      logger.info(`Total de chats encontrados: ${totalChats} para sesión ${sessionId}`);
+      
+      // Aplicar paginación
+      const paginatedChats = allChats
+        .slice(parseInt(offset), parseInt(offset) + parseInt(limit));
+      
+      // Formatear la información de cada chat
+      const chatList = await Promise.all(
+        paginatedChats.map(async (chat, index) => {
+          try {
+            // Log de progreso cada 10 chats
+            if (index % 10 === 0) {
+              logger.debug(`Procesando chat ${index + 1}/${paginatedChats.length} para sesión ${sessionId}`);
+            }
+
+            // Obtener información básica del chat
+            const contact = await chat.getContact();
+            const lastMessage = chat.lastMessage;
+            
+            // Formatear información del chat
+            const chatInfo = {
+              id: chat.id._serialized,
+              name: chat.name || contact.name || contact.pushname || chat.id.user || 'Sin nombre',
+              isGroup: chat.isGroup,
+              isMuted: chat.isMuted || false,
+              unreadCount: chat.unreadCount || 0,
+              timestamp: chat.timestamp || Date.now(),
+              // Información del último mensaje
+              lastMessage: lastMessage ? {
+                body: lastMessage.body || '[Media]',
+                timestamp: lastMessage.timestamp,
+                fromMe: lastMessage.fromMe,
+                type: lastMessage.type || 'text'
+              } : null,
+              // Información del contacto/grupo
+              contact: {
+                id: contact.id._serialized,
+                name: contact.name || contact.pushname || 'Sin nombre',
+                shortName: contact.shortName || null,
+                isMyContact: contact.isMyContact || false,
+                isBlocked: contact.isBlocked || false,
+                profilePic: null // Se obtiene después si es necesario
+              }
+            };
+
+            // Intentar obtener la foto de perfil (puede fallar, no es crítico)
+            if (!forceRefresh) {
+              // Solo obtener foto si no es refresh para evitar timeouts
+              try {
+                const profilePicUrl = await Promise.race([
+                  contact.getProfilePicUrl(),
+                  new Promise((_, reject) => 
+                    setTimeout(() => reject(new Error('Timeout foto perfil')), 3000)
+                  )
+                ]);
+                chatInfo.contact.profilePic = profilePicUrl;
+              } catch (picError) {
+                // No hacer nada, la foto queda como null
+              }
+            }
+
+            // Si es un grupo, obtener información adicional
+            if (chat.isGroup) {
+              try {
+                chatInfo.groupInfo = {
+                  description: chat.groupMetadata?.desc || '',
+                  participantsCount: chat.groupMetadata?.participants?.length || 0,
+                  owner: chat.groupMetadata?.owner?._serialized || null
+                };
+              } catch (groupError) {
+                logger.debug(`Error obteniendo info del grupo ${chat.id._serialized}: ${groupError.message}`);
+              }
+            }
+
+            return chatInfo;
+            
+          } catch (chatError) {
+            logger.warn(`Error procesando chat ${chat.id._serialized}: ${chatError.message}`);
+            // Devolver información básica en caso de error
+            return {
+              id: chat.id._serialized,
+              name: chat.name || chat.id.user || 'Chat con error',
+              isGroup: chat.isGroup || false,
+              unreadCount: chat.unreadCount || 0,
+              timestamp: chat.timestamp || Date.now(),
+              error: 'Error obteniendo detalles del chat',
+              lastMessage: null,
+              contact: {
+                id: chat.id._serialized,
+                name: 'Error al cargar contacto',
+                profilePic: null
+              }
+            };
+          }
+        })
+      );
+
+      const result = {
+        success: true,
+        sessionId,
+        chats: chatList,
+        pagination: {
+          total: totalChats,
+          limit: parseInt(limit),
+          offset: parseInt(offset),
+          hasMore: (parseInt(offset) + parseInt(limit)) < totalChats,
+          returned: chatList.length
+        },
+        timestamp: Date.now()
+      };
+
+      logger.info(`Devolviendo ${chatList.length} chats de ${totalChats} totales para sesión ${sessionId}`);
+      
+      return result;
+
+    } catch (error) {
+      logger.error(`Error obteniendo chats para sesión ${sessionId}:`, {
+        errorMessage: error.message,
+        stack: error.stack
+      });
+      throw error;
+    }
+  }
+
+  /**
+   * Obtiene chats básicos (versión rápida sin fotos de perfil)
+   * @param {string} sessionId - ID de la sesión
+   * @param {number} limit - Límite de chats
+   * @param {number} offset - Offset para paginación
+   * @returns {Object} Lista básica de chats
+   */
+  async getBasicSessionChats(sessionId, limit = 20, offset = 0) {
+    try {
+      logger.info(`Obteniendo chats básicos para sesión ${sessionId} (limit: ${limit}, offset: ${offset})`);
+      
+      const session = this.clients.get(sessionId);
+      if (!session || !session.client) {
+        throw new Error(`Sesión ${sessionId} no encontrada`);
+      }
+
+      const client = session.client;
+      const state = await client.getState();
+      if (state !== 'CONNECTED') {
+        throw new Error(`Cliente no conectado. Estado: ${state}`);
+      }
+
+      const allChats = await client.getChats();
+      const totalChats = allChats.length;
+      
+      const basicChats = allChats
+        .slice(parseInt(offset), parseInt(offset) + parseInt(limit))
+        .map((chat, index) => {
+          try {
+            return {
+              id: chat.id._serialized,
+              name: chat.name || chat.id.user || 'Sin nombre',
+              isGroup: chat.isGroup || false,
+              unreadCount: chat.unreadCount || 0,
+              timestamp: chat.timestamp || Date.now(),
+              lastMessagePreview: chat.lastMessage?.body?.substring(0, 50) || '',
+              isMuted: chat.isMuted || false
+            };
+          } catch (error) {
+            logger.warn(`Error procesando chat básico ${index}: ${error.message}`);
+            return {
+              id: `error-${index}`,
+              name: 'Error al cargar chat',
+              isGroup: false,
+              unreadCount: 0,
+              timestamp: Date.now(),
+              lastMessagePreview: '',
+              error: true
+            };
+          }
+        });
+
+      return {
+        success: true,
+        sessionId,
+        chats: basicChats,
+        total: totalChats,
+        pagination: {
+          limit: parseInt(limit),
+          offset: parseInt(offset),
+          hasMore: (parseInt(offset) + parseInt(limit)) < totalChats
+        },
+        timestamp: Date.now()
+      };
+
+    } catch (error) {
+      logger.error(`Error obteniendo chats básicos para sesión ${sessionId}:`, {
+        errorMessage: error.message
+      });
+      throw error;
+    }
+  }
+
+  /**
+   * Actualiza el estado de escucha de un chat específico
+   * @param {string} sessionId - ID de la sesión
+   * @param {string} chatId - ID del chat
+   * @param {boolean} isListening - Si el chat debe ser escuchado o no
+   * @returns {Promise<Object>} - Objeto con el resultado de la operación
+   */
+  async updateChatListeningStatus(sessionId, chatId, isListening) {
+    const session = this.clients.get(sessionId);
+    if (!session) {
+      throw new Error(`Sesión ${sessionId} no encontrada`);
+    }
+
+    // Validar que chatId es válido
+    if (!chatId || typeof chatId !== 'string') {
+      throw new Error('chatId inválido');
+    }
+
+    // Validar que isListening es boolean
+    if (typeof isListening !== 'boolean') {
+      throw new Error('isListening debe ser un valor booleano');
+    }
+
+    try {
+      // Inicializar filtros de chat si no existen
+      if (!session.chatFilters) {
+        session.chatFilters = new Map();
+      }
+      
+      // Actualizar estado en memoria
+      session.chatFilters.set(chatId, isListening);
+      
+      // Actualizar estado en el servicio de chats
+      await chatService.updateChatListeningStatus(sessionId, chatId, isListening);
+      
+      logger.info(`Chat ${chatId} ahora está ${isListening ? 'escuchando' : 'ignorando'} en sesión ${sessionId}`);
+      
+      return {
+        status: 'success',
+        chatId,
+        isListening
+      };
+    } catch (error) {
+      logger.error(`Error al actualizar estado de escucha para chat ${chatId} en sesión ${sessionId}:`, {
+        errorMessage: error.message,
+        sessionId,
+        chatId,
+        isListening
+      });
+      throw error;
+    }
+  }
+    // ===== NUEVO MÉTODO 1 =====
+  async sendStopListeningCommand(sessionId) {
+    const session = this.clients.get(sessionId);
+    if (!session) {
+      logger.warn(`No se puede enviar comando de resumen: sesión ${sessionId} no encontrada`);
+      return;
+    }
+
+    try {
+      // Obtener todos los chats que tienen mensajes en buffer
+      const chatsWithMessages = Object.keys(session.messageBuffer).filter(
+        chatId => session.messageBuffer[chatId] && session.messageBuffer[chatId].length > 0
+      );
+
+      logger.info(`Enviando comando de resumen para ${chatsWithMessages.length} chats en sesión ${sessionId}`);
+
+      // Enviar comando de resumen para cada chat que tiene mensajes
+      for (const chatId of chatsWithMessages) {
+        await this.sendSummaryCommandForChat(sessionId, chatId);
+      }
+
+    } catch (error) {
+      logger.error(`Error enviando comandos de resumen para sesión ${sessionId}:`, {
+        errorMessage: error.message,
+        sessionId
+      });
+    }
+  }
+
+  // ===== NUEVO MÉTODO 2 =====
+  async sendSummaryCommandForChat(sessionId, chatId) {
+    const session = this.clients.get(sessionId);
+    if (!session || !session.messageBuffer[chatId]) {
+      return;
+    }
+
+    try {
+      // Obtener el último mensaje del buffer para extraer info del chat
+      const lastMessage = session.messageBuffer[chatId][session.messageBuffer[chatId].length - 1];
+      
+      // Crear mensaje de comando sintético
+      const commandMessage = {
+        id: `stop_command_${Date.now()}`,
+        from: chatId,
+        to: session.client.info?.wid?._serialized || 'unknown',
+        body: 'GIVE_ME_SUMMARY_N8N',
+        timestamp: Math.floor(Date.now() / 1000), // En segundos
+        hasMedia: false,
+        type: 'chat',
+        isForwarded: false,
+        isStatus: false,
+        isGroupMessage: lastMessage?.isGroupMessage || false,
+        sessionId: sessionId,
+        // Copiar información de contacto/grupo del último mensaje
+        contact: lastMessage?.contact || null,
+        group: lastMessage?.group || null,
+        contactName: lastMessage?.contactName || 'Sistema',
+        authorName: lastMessage?.authorName || null,
+        authorContact: lastMessage?.authorContact || null
+      };
+
+      // Agregar el comando al buffer
+      session.messageBuffer[chatId].push(commandMessage);
+      
+      // Enviar el chunk inmediatamente (esto incluirá el comando)
+      await this.sendMessageChunk(sessionId, chatId);
+      
+      logger.info(`Comando de resumen enviado para chat ${chatId} en sesión ${sessionId}`);
+      
+    } catch (error) {
+      logger.error(`Error enviando comando de resumen para chat ${chatId}:`, {
+        errorMessage: error.message,
+        sessionId,
+        chatId
+      });
+    }
   }
 }
 

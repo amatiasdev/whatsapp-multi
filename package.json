@@ -1,7 +1,7 @@
 {
   "name": "whatsapp-listener",
   "version": "1.0.0",
-  "description": "Backend para escuchar mensajes de WhatsApp y enviarlos en chunks a n8n",
+  "description": "Servicio de WhatsApp para escuchar mensajes de WhatsApp y enviarlos en chunks a n8n",
   "main": "index.js",
   "scripts": {
     "start": "node src/server.js",
@@ -24,7 +24,7 @@
     "qrcode-terminal": "^0.12.0",
     "socket.io": "^4.8.1",
     "whatsapp-web.js": "^1.23.0",
-    "winston": "^3.11.0"
+    "winston": "^3.17.0"
   },
   "devDependencies": {
     "nodemon": "^3.0.1"
