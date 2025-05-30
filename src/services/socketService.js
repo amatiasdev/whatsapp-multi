@@ -287,7 +287,7 @@ class SocketService {
       return;
     }
     
-    this.io.to(sessionId).emit('session-status', {
+    this.io.emit('session-status', {
       sessionId,
       status,
       ...data,

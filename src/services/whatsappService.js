@@ -10,11 +10,11 @@ const contactsManager = require('./contactsManager');
 const qrService = require('./qrService');
 const chatService = require('./whatsappChatService');
 const socketService = require('./socketService');
+
 class WhatsAppService {
-
-
   constructor() {
     this.clients = new Map(); // Map de clientId -> { client, isListening, messageBuffer }
+    this.restorationPromises = {}; // ✅ Nuevo: almacena promesas de restauración por sessionId
     this.ensureSessionDirectory();
     setInterval(() => {
         try {
@@ -68,6 +68,18 @@ class WhatsAppService {
       throw new Error(`No se puede crear sesión: ${validation.reason}. ${validation.maxSessions ? `Límite: ${validation.maxSessions}` : ''}`);
     }
 
+    // ✅ Si es restauración desde disco, crear promesa antes de continuar
+    if (fromDisk) {
+      this.restorationPromises[sessionId] = {};
+      this.restorationPromises[sessionId].promise = new Promise((resolve, reject) => {
+        this.restorationPromises[sessionId].resolve = resolve;
+        this.restorationPromises[sessionId].reject = reject;
+      });
+      this.restorationPromises[sessionId].createdAt = Date.now(); // ✅ Timestamp para limpieza
+      
+      logger.debug(`🔄 Promesa de restauración creada para sesión ${sessionId}`);
+    }
+
     // Verificar si ya existe una sesión con este ID
     if (this.clients.has(sessionId)) {
       if (fromDisk) {
@@ -113,7 +125,9 @@ class WhatsAppService {
         chunkTimers: {},
         createdAt: Date.now(),
         lastActivity: Date.now(),
-        reconnectionAttempts: 0
+        reconnectionAttempts: 0,
+        isConnected: false, // ✅ Track explícito del estado de conexión
+        readyAt: null
       });
     }
 
@@ -166,7 +180,7 @@ class WhatsAppService {
       session.reconnectionAttempts = 0; // Reset contador en autenticación exitosa
     });
 
-    // Manejar conexión exitosa
+    // ✅ Manejar conexión exitosa con resolución de promesa
     client.on('ready', async () => {
       logger.info(`Cliente WhatsApp listo y conectado para la sesión ${sessionId}`);
 
@@ -185,6 +199,19 @@ class WhatsAppService {
       // Emitir evento de conexión exitosa
       socketService.markSessionConnected(sessionId);
       
+      // ✅ Resolver promesa de restauración si existe
+      if (this.restorationPromises[sessionId]) {
+        logger.debug(`✅ Resolviendo promesa de restauración para sesión ${sessionId}`);
+        this.restorationPromises[sessionId].resolve({
+          sessionId,
+          status: 'ready',
+          readyAt: new Date()
+        });
+        
+        // Limpiar promesa para evitar fugas de memoria
+        delete this.restorationPromises[sessionId];
+      }
+      
       logger.info(`Sesión ${sessionId} lista para recibir comandos`);
     });
 
@@ -197,10 +224,17 @@ class WhatsAppService {
       socketService.emitSessionStatus(sessionId, 'state_change', { state });
     });
 
-    // Manejar errores de autenticación
+    // ✅ Manejar errores de autenticación con manejo de promesas
     client.on('auth_failure', (message) => {
       logger.error(`Fallo de autenticación en sesión ${sessionId}: ${message}`);
       session.reconnectionAttempts = (session.reconnectionAttempts || 0) + 1;
+      
+      // ✅ Rechazar promesa de restauración si existe
+      if (this.restorationPromises[sessionId]) {
+        logger.debug(`❌ Rechazando promesa de restauración para sesión ${sessionId} (auth_failure)`);
+        this.restorationPromises[sessionId].reject(new Error(`Auth failure: ${message}`));
+        delete this.restorationPromises[sessionId];
+      }
       
       // Emitir error por socket
       socketService.emitSessionStatus(sessionId, 'auth_failure', { 
@@ -209,12 +243,20 @@ class WhatsAppService {
       });
     });
 
-    // Manejar desconexión con lógica mejorada
+    // ✅ Manejar desconexión con lógica mejorada y limpieza de promesas
     client.on('disconnected', (reason) => {
       logger.warn(`Cliente WhatsApp desconectado para la sesión ${sessionId}: ${reason}`);
       
       session.lastActivity = Date.now();
       session.lastDisconnectionReason = reason;
+      session.isConnected = false; // ✅ Marcar como desconectado
+      
+      // ✅ Rechazar promesa de restauración si existe y es una desconexión inesperada
+      if (this.restorationPromises[sessionId]) {
+        logger.debug(`❌ Rechazando promesa de restauración para sesión ${sessionId} (disconnected: ${reason})`);
+        this.restorationPromises[sessionId].reject(new Error(`Disconnected during restoration: ${reason}`));
+        delete this.restorationPromises[sessionId];
+      }
       
       // Marcar como desconectado en servicios
       if (typeof qrService.markSessionDisconnected === 'function') {
@@ -226,7 +268,7 @@ class WhatsAppService {
       this.handleAutomaticReconnection(sessionId, reason);
     });
 
-    // Manejar errores del cliente
+    // ✅ Manejar errores del cliente con limpieza de promesas
     client.on('error', (error) => {
       logger.error(`Error en cliente WhatsApp para sesión ${sessionId}:`, {
         errorMessage: error.message,
@@ -234,6 +276,13 @@ class WhatsAppService {
       });
       
       session.lastActivity = Date.now();
+      
+      // ✅ Rechazar promesa de restauración si existe
+      if (this.restorationPromises[sessionId]) {
+        logger.debug(`❌ Rechazando promesa de restauración para sesión ${sessionId} (client error)`);
+        this.restorationPromises[sessionId].reject(error);
+        delete this.restorationPromises[sessionId];
+      }
       
       // Emitir error por socket
       socketService.emitSessionStatus(sessionId, 'client_error', { 
@@ -267,6 +316,13 @@ class WhatsAppService {
         stack: error.stack
       });
       
+      // ✅ Rechazar promesa de restauración si existe
+      if (this.restorationPromises[sessionId]) {
+        logger.debug(`❌ Rechazando promesa de restauración para sesión ${sessionId} (init error)`);
+        this.restorationPromises[sessionId].reject(error);
+        delete this.restorationPromises[sessionId];
+      }
+      
       // Limpiar en caso de error
       this.cleanupSession(sessionId);
       
@@ -278,6 +334,48 @@ class WhatsAppService {
       } else {
         throw new Error(`Error al inicializar: ${error.message}`);
       }
+    }
+  }
+
+  // ✅ Nuevo método para obtener promesa de restauración
+  getRestorationPromise(sessionId) {
+    return this.restorationPromises[sessionId]?.promise || null;
+  }
+
+  // ✅ Nuevo método para verificar si una sesión está en proceso de restauración
+  isRestoring(sessionId) {
+    return !!this.restorationPromises[sessionId];
+  }
+
+  // ✅ Nuevo método para obtener todas las promesas de restauración
+  getAllRestorationPromises() {
+    const promises = Object.keys(this.restorationPromises).map(sessionId => 
+      this.restorationPromises[sessionId].promise
+    );
+    return promises;
+  }
+
+  // ✅ Limpiar promesas huérfanas (método de mantenimiento)
+  cleanupOrphanedPromises() {
+    const now = Date.now();
+    const maxWaitTime = 5 * 60 * 1000; // 5 minutos
+    
+    let cleanedCount = 0;
+    
+    Object.keys(this.restorationPromises).forEach(sessionId => {
+      const promiseData = this.restorationPromises[sessionId];
+      if (promiseData.createdAt && (now - promiseData.createdAt) > maxWaitTime) {
+        logger.warn(`🧹 Limpiando promesa huérfana para sesión ${sessionId} (${Math.round((now - promiseData.createdAt) / 1000)}s)`);
+        promiseData.reject(new Error('Timeout waiting for restoration'));
+        delete this.restorationPromises[sessionId];
+        cleanedCount++;
+      }
+    });
+    
+    if (cleanedCount > 0) {
+      logger.info(`🧹 Limpiadas ${cleanedCount} promesas huérfanas de restauración`);
+    } else {
+      logger.debug(`🧹 No se encontraron promesas huérfanas para limpiar`);
     }
   }
 
@@ -345,7 +443,6 @@ class WhatsAppService {
 
     return { status: 'listening_stopped' };
   }
-
 
   async handleMessage(sessionId, message) {
     const session = this.clients.get(sessionId);
@@ -612,6 +709,13 @@ class WhatsAppService {
     }
 
     try {
+      // ✅ Limpiar promesa de restauración pendiente si existe
+      if (this.restorationPromises[sessionId]) {
+        logger.debug(`🧹 Limpiando promesa de restauración pendiente para sesión ${sessionId}`);
+        this.restorationPromises[sessionId].reject(new Error('Session cleanup requested'));
+        delete this.restorationPromises[sessionId];
+      }
+
       // Detener la escucha si está activa
       if (session.isListening) {
         this.stopListening(sessionId);
@@ -680,13 +784,15 @@ class WhatsAppService {
       exists: true,
       sessionId,
       isListening: session.isListening,
-      isConnected: session.client?.info ? true : false,
+      isConnected: session.isConnected, // ✅ Usar el track explícito
       totalBufferSize,
       bufferStats,
       activeTimers: Object.keys(session.chunkTimers).length,
       clientInfo,
       socketConnections: socketService.getConnectionCount(sessionId),
-      chatFiltersCount: session.chatFilters ? session.chatFilters.size : 0
+      chatFiltersCount: session.chatFilters ? session.chatFilters.size : 0,
+      isRestoring: this.isRestoring(sessionId), // ✅ Indicar si está en proceso de restauración
+      readyAt: session.readyAt
     };
   }
 
@@ -703,7 +809,7 @@ class WhatsAppService {
 
     return {
       exists: true,
-      isConnected: client.isConnected || false,
+      isConnected: client.isConnected || false, // ✅ Usar el track explícito
       isListening: client.isListening || false
     };
   }
@@ -714,10 +820,12 @@ class WhatsAppService {
       sessions.push({
         sessionId,
         isListening: session.isListening,
-        isConnected: session.client?.info ? true : false,
+        isConnected: session.isConnected || false, // ✅ Usar el track explícito
         bufferSize: Object.keys(session.messageBuffer).reduce(
           (total, chatId) => total + session.messageBuffer[chatId].length, 0
-        )
+        ),
+        isRestoring: this.isRestoring(sessionId), // ✅ Incluir estado de restauración
+        readyAt: session.readyAt
       });
     }
     return sessions;
@@ -1015,7 +1123,7 @@ class WhatsAppService {
       // Obtener todos los chats que tienen mensajes en buffer
       const allChats = Object.keys(session.messageBuffer);
 
-      logger.info(`Enviando comando de resumen para ${chatsWithMessages.length} chats en sesión ${sessionId}`);
+      logger.info(`Enviando comando de resumen para ${allChats.length} chats en sesión ${sessionId}`);
 
       // Enviar comando de resumen para cada chat que tiene mensajes
       for (const chatId of allChats) {
@@ -1193,6 +1301,13 @@ class WhatsAppService {
     try {
       logger.info(`Destruyendo cliente para sesión ${sessionId}`);
       
+      // ✅ Limpiar promesa de restauración si existe
+      if (this.restorationPromises[sessionId]) {
+        logger.debug(`🧹 Limpiando promesa de restauración durante destrucción para sesión ${sessionId}`);
+        this.restorationPromises[sessionId].reject(new Error('Client destroyed'));
+        delete this.restorationPromises[sessionId];
+      }
+      
       // Detener escucha si está activa
       if (session.isListening) {
         session.client.removeAllListeners('message');
@@ -1212,6 +1327,7 @@ class WhatsAppService {
       
       // Mantener la estructura de sesión pero limpiar el cliente
       session.client = null;
+      session.isConnected = false; // ✅ Marcar como desconectado
       session.lastActivity = Date.now();
       session.reconnectionAttempts = (session.reconnectionAttempts || 0) + 1;
       
@@ -1255,6 +1371,9 @@ class WhatsAppService {
     };
 
     logger.info(`Iniciando limpieza de sesiones (force: ${force})`);
+
+    // ✅ También limpiar promesas huérfanas durante la limpieza
+    this.cleanupOrphanedPromises();
 
     for (const [sessionId, session] of this.clients.entries()) {
       try {
@@ -1331,6 +1450,7 @@ class WhatsAppService {
       hasErrors: 0,
       totalBufferSize: 0,
       totalActiveTimers: 0,
+      restoring: 0, // ✅ Contador de sesiones en restauración
       sessionDetails: [],
       limits: {
         maxSessions: config.maxSessions,
@@ -1345,6 +1465,7 @@ class WhatsAppService {
         // Contadores generales
         if (sessionInfo.isConnected) stats.connected++;
         if (sessionInfo.isListening) stats.listening++;
+        if (sessionInfo.isRestoring) stats.restoring++; // ✅ Contar sesiones en restauración
         
         const lastActivity = session.lastActivity || session.createdAt || 0;
         const timeSinceActivity = now - lastActivity;
@@ -1365,12 +1486,14 @@ class WhatsAppService {
           sessionId,
           isConnected: sessionInfo.isConnected,
           isListening: sessionInfo.isListening,
+          isRestoring: sessionInfo.isRestoring, // ✅ Incluir estado de restauración
           bufferSize: sessionInfo.totalBufferSize || 0,
           activeTimers: sessionInfo.activeTimers || 0,
           lastActivity: new Date(lastActivity),
           timeSinceActivity: Math.round(timeSinceActivity / 1000 / 60), // minutos
           reconnectionAttempts: session.reconnectionAttempts || 0,
-          socketConnections: sessionInfo.socketConnections || 0
+          socketConnections: sessionInfo.socketConnections || 0,
+          readyAt: session.readyAt
         });
         
       } catch (error) {
@@ -1381,7 +1504,8 @@ class WhatsAppService {
         stats.sessionDetails.push({
           sessionId,
           error: error.message,
-          lastActivity: new Date(session.lastActivity || 0)
+          lastActivity: new Date(session.lastActivity || 0),
+          isRestoring: this.isRestoring(sessionId) // ✅ Verificar estado de restauración incluso en error
         });
       }
     }
