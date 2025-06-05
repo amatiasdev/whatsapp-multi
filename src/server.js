@@ -722,7 +722,7 @@ const PORT = config.port;
 server.listen(PORT, () => {
   const nodeEnv = config.nodeEnv || process.env.NODE_ENV || 'development';
   logger.info(`Servidor ejecutándose en modo ${nodeEnv} en puerto ${PORT}`);
-  logger.info(`Configuración cargada: Max Sessions=${config.maxSessions}, Chunk Size=${config.messageChunkSize}, Chunk Interval=${config.chunkSendIntervalMs}ms`);
+  logger.info(`Configuración cargada: Max Sessions=${config.maxSessions}`);
 });
 
 // Manejo de señales para cierre limpio

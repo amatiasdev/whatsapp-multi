@@ -32,17 +32,18 @@ module.exports = {
   maxRetries: parseInt(process.env.MAX_RETRIES || '3', 10),
   retryDelay: parseInt(process.env.RETRY_DELAY || '5000', 10), // 5 segundos
   
-  // Webhooks
-  n8nWebhookUrl: process.env.BACKEND_WEBHOOK_URL || 'http://localhost:5678/webhook/whatsapp-messages',
-  webhookTimeout: parseInt(process.env.WEBHOOK_TIMEOUT || '30000', 10), // 30 segundos
-  webhookRetries: parseInt(process.env.WEBHOOK_RETRIES || '3', 10),
+  // ✅ NUEVA CONFIGURACIÓN PARA BACKEND INDIVIDUAL
+  backend: {
+    apiUrl: process.env.BACKEND_API_URL || 'http://localhost:3000',
+    messagesEndpoint: process.env.BACKEND_MESSAGES_ENDPOINT || '/api/v1/whatsapp/messages',
+    timeout: parseInt(process.env.BACKEND_TIMEOUT || '3000', 10), // 3 segundos
+    retries: parseInt(process.env.BACKEND_RETRIES || '1', 10), // 1 retry
+    retryDelay: parseInt(process.env.BACKEND_RETRY_DELAY || '1000', 10), // 1 segundo
+    userAgent: `WhatsApp-Microservice/${process.env.WHATSAPP_SERVICE_VERSION || '1.0.0-mvp'}`
+  },
+
   
-  // Mensajes y chunks
-  messageChunkSize: parseInt(process.env.MESSAGE_CHUNK_SIZE || '5', 10),
-  chunkSendIntervalMs: parseInt(process.env.CHUNK_SEND_INTERVAL_MS || '30000', 10), // 30 segundos
-  maxMessageBuffer: parseInt(process.env.MAX_MESSAGE_BUFFER || '1000', 10),
-  
-  // Filtros de mensajes
+  // Filtros de mensajes (mantenidos)
   messageFilters: {
     ignoreStatus: process.env.IGNORE_STATUS !== 'false', // Por defecto true
     ignoreGroups: process.env.IGNORE_GROUPS === 'true', // Por defecto false
@@ -114,18 +115,15 @@ module.exports = {
     }
   },
   
-  // Configuraciones de monitoreo
-  monitoring: {
-    enabled: process.env.MONITORING_ENABLED === 'true',
-    logDetailedStats: process.env.LOG_DETAILED_STATS === 'true',
-    alertOnCriticalIssues: process.env.ALERT_ON_CRITICAL !== 'false', // Por defecto habilitado
-    statsRetentionDays: parseInt(process.env.STATS_RETENTION_DAYS || '7', 10)
+  // ✅ NUEVAS CONFIGURACIONES DE ESTADÍSTICAS
+  statistics: {
+    enabled: process.env.STATS_ENABLED !== 'false',
+    logEvery: parseInt(process.env.STATS_LOG_EVERY || '100', 10), // Log cada 100 mensajes
+    retentionDays: parseInt(process.env.STATS_RETENTION_DAYS || '7', 10)
   },
   
-  // Configuraciones de performance
+  // Configuraciones de performance (actualizadas)
   performance: {
-    maxBufferSizePerChat: parseInt(process.env.MAX_BUFFER_SIZE_PER_CHAT || '100', 10),
-    maxTotalBufferSize: parseInt(process.env.MAX_TOTAL_BUFFER_SIZE || '1000', 10),
     gcIntervalMs: parseInt(process.env.GC_INTERVAL_MS || '1800000', 10), // 30 minutos
     memoryWarningThresholdMB: parseInt(process.env.MEMORY_WARNING_THRESHOLD_MB || '512', 10)
   },
@@ -147,16 +145,17 @@ module.exports = {
       errors.push('MAX_SESSIONS debe ser mayor a 0');
     }
     
-    if (this.messageChunkSize < 1) {
-      errors.push('MESSAGE_CHUNK_SIZE debe ser mayor a 0');
+    // Validar configuración del backend
+    if (!this.backend.apiUrl.startsWith('http')) {
+      errors.push('BACKEND_API_URL debe ser una URL válida que comience con http/https');
     }
     
-    if (this.chunkSendIntervalMs < 1000) {
-      errors.push('CHUNK_SEND_INTERVAL_MS debe ser al menos 1000ms');
+    if (!this.backend.messagesEndpoint.startsWith('/')) {
+      errors.push('BACKEND_MESSAGES_ENDPOINT debe comenzar con /');
     }
     
-    if (!this.n8nWebhookUrl.startsWith('http')) {
-      errors.push('BACKEND_WEBHOOK_URL debe ser una URL válida');
+    if (this.backend.timeout < 1000 || this.backend.timeout > 30000) {
+      errors.push('BACKEND_TIMEOUT debe estar entre 1000ms y 30000ms');
     }
     
     if (errors.length > 0) {
@@ -166,7 +165,6 @@ module.exports = {
     return true;
   },
   
-  // Validación extendida
   validateExtended() {
     const errors = [];
     
@@ -207,11 +205,6 @@ module.exports = {
       errors.push('CRITICAL_SYSTEM_USAGE debe estar entre 50 y 100');
     }
     
-    // Validar configuraciones de performance
-    if (this.performance.maxBufferSizePerChat < 10 || this.performance.maxBufferSizePerChat > 1000) {
-      errors.push('MAX_BUFFER_SIZE_PER_CHAT debe estar entre 10 y 1000');
-    }
-    
     // Validar configuraciones de seguridad
     if (this.security.maxSessionIdLength < 5 || this.security.maxSessionIdLength > 100) {
       errors.push('MAX_SESSION_ID_LENGTH debe estar entre 5 y 100');
@@ -231,9 +224,7 @@ module.exports = {
     const maxDelay = this.reconnection.maxDelayMs;
     
     const delay = Math.min(baseDelay * Math.pow(factor, attempt - 1), maxDelay);
-    
-    // Añadir un poco de jitter para evitar el efecto "thundering herd"
-    const jitter = Math.random() * 0.1 * delay; // 10% de jitter
+    const jitter = Math.random() * 0.1 * delay;
     
     return Math.round(delay + jitter);
   },
@@ -266,66 +257,6 @@ module.exports = {
     };
   },
   
-  // Método para calcular la salud del sistema
-  calculateSystemHealth(stats) {
-    let healthScore = 100;
-    const thresholds = this.health.criticalThresholds;
-    
-    // Penalizar por uso alto del sistema
-    const usagePercent = (stats.total / this.sessionLimits.maxGlobal) * 100;
-    if (usagePercent > thresholds.systemUsagePercent) {
-      healthScore -= 30;
-    } else if (usagePercent > thresholds.systemUsagePercent - 20) {
-      healthScore -= 15;
-    }
-    
-    // Penalizar por sesiones desconectadas
-    const disconnectedPercent = ((stats.total - stats.connected) / stats.total) * 100;
-    if (disconnectedPercent > thresholds.disconnectedSessionsPercent) {
-      healthScore -= 25;
-    }
-    
-    // Penalizar por alta inactividad
-    const inactivePercent = (stats.inactive / stats.total) * 100;
-    if (inactivePercent > 40) {
-      healthScore -= 20;
-    }
-    
-    // Penalizar por errores frecuentes
-    if (stats.hasErrors > stats.total * 0.3) {
-      healthScore -= 15;
-    }
-    
-    // Penalizar por buffers grandes
-    if (stats.totalBufferSize > this.performance.maxTotalBufferSize) {
-      healthScore -= 10;
-    }
-    
-    return {
-      score: Math.max(0, Math.min(100, healthScore)),
-      level: healthScore >= 80 ? 'excellent' :
-             healthScore >= 60 ? 'good' :
-             healthScore >= 40 ? 'warning' : 'critical',
-      usagePercent: Math.round(usagePercent),
-      disconnectedPercent: Math.round(disconnectedPercent),
-      inactivePercent: Math.round(inactivePercent)
-    };
-  },
-  
-  // Método para obtener configuraciones de memoria
-  getMemoryConfig() {
-    return {
-      warningThreshold: this.performance.memoryWarningThresholdMB * 1024 * 1024, // Convert to bytes
-      maxBufferSize: this.performance.maxTotalBufferSize,
-      gcInterval: this.performance.gcIntervalMs,
-      shouldTriggerGC: () => {
-        const usage = process.memoryUsage();
-        return usage.heapUsed > (this.performance.memoryWarningThresholdMB * 1024 * 1024);
-      }
-    };
-  },
-  
-  // Método para validar un sessionId
   validateSessionId(sessionId) {
     if (!this.security.sessionIdValidation) {
       return { valid: true };

@@ -3,19 +3,12 @@ const config = require('../config');
 const logger = require('../utils/logger');
 
 /**
- * Servicio para comunicación directa con el backend principal
+ * Servicio simplificado para comunicación directa con el backend principal
  */
 class BackendService {
   constructor() {
     this.initialized = false;
     this.client = null;
-    this.stats = {
-      totalMessages: 0,
-      successfulSends: 0,
-      failedSends: 0,
-      lastError: null,
-      startTime: Date.now()
-    };
     
     this.initializeClient();
   }
@@ -33,47 +26,18 @@ class BackendService {
           'Content-Type': 'application/json',
           'User-Agent': config.backend.userAgent,
           'Accept': 'application/json'
-        },
-        // Configuración de reintentos
-        retries: config.backend.retries,
-        retryDelay: config.backend.retryDelay
+        }
       });
-
-      // Interceptor para logging de requests
-      this.client.interceptors.request.use(
-        (config) => {
-          logger.debug(`Enviando request al backend: ${config.method?.toUpperCase()} ${config.url}`);
-          return config;
-        },
-        (error) => {
-          logger.error('Error en request interceptor:', { errorMessage: error.message });
-          return Promise.reject(error);
-        }
-      );
-
-      // Interceptor para logging de responses
-      this.client.interceptors.response.use(
-        (response) => {
-          logger.debug(`Response del backend: ${response.status} ${response.statusText}`);
-          return response;
-        },
-        (error) => {
-          logger.debug(`Error response del backend: ${error.response?.status || 'No status'} ${error.message}`);
-          return Promise.reject(error);
-        }
-      );
 
       this.initialized = true;
       logger.info('Cliente HTTP para backend inicializado correctamente', {
         baseURL: config.backend.apiUrl,
-        timeout: config.backend.timeout,
-        userAgent: config.backend.userAgent
+        timeout: config.backend.timeout
       });
 
     } catch (error) {
       logger.error('Error al inicializar cliente HTTP para backend:', {
-        errorMessage: error.message,
-        stack: error.stack
+        errorMessage: error.message
       });
       this.initialized = false;
     }
@@ -87,12 +51,8 @@ class BackendService {
   async sendMessageToBackend(messageData) {
     if (!this.initialized || !this.client) {
       logger.warn('Cliente HTTP no inicializado, no se puede enviar mensaje');
-      this.stats.failedSends++;
       return false;
     }
-
-    const startTime = Date.now();
-    this.stats.totalMessages++;
 
     try {
       // Preparar payload con estructura estándar
@@ -102,9 +62,7 @@ class BackendService {
       logger.debug(`Enviando mensaje individual al backend`, {
         messageId: messageData.id,
         chatId: messageData.from,
-        sessionId: messageData.sessionId,
-        hasMedia: messageData.hasMedia || false,
-        messageType: messageData.type
+        sessionId: messageData.sessionId
       });
 
       // Realizar request con timeout específico
@@ -112,21 +70,12 @@ class BackendService {
 
       // Verificar respuesta exitosa
       if (response.status >= 200 && response.status < 300) {
-        this.stats.successfulSends++;
-        const duration = Date.now() - startTime;
-        
         logger.info(`Mensaje enviado exitosamente al backend`, {
           messageId: messageData.id,
           chatId: messageData.from,
           sessionId: messageData.sessionId,
-          responseStatus: response.status,
-          duration: `${duration}ms`
+          responseStatus: response.status
         });
-
-        // Log estadísticas cada 100 mensajes
-        if (this.stats.totalMessages % config.statistics.logEvery === 0) {
-          this.logStatistics();
-        }
 
         return true;
       } else {
@@ -134,23 +83,13 @@ class BackendService {
       }
 
     } catch (error) {
-      this.stats.failedSends++;
-      this.stats.lastError = {
-        message: error.message,
-        timestamp: new Date(),
-        messageId: messageData.id
-      };
-
-      const duration = Date.now() - startTime;
-      
       // Log error pero no fallar
       if (error.code === 'ECONNREFUSED' || error.code === 'ETIMEDOUT') {
         logger.warn(`Backend no disponible, mensaje no enviado`, {
           messageId: messageData.id,
           chatId: messageData.from,
           sessionId: messageData.sessionId,
-          error: error.code,
-          duration: `${duration}ms`
+          error: error.code
         });
       } else {
         logger.error(`Error al enviar mensaje al backend`, {
@@ -159,8 +98,7 @@ class BackendService {
           sessionId: messageData.sessionId,
           errorMessage: error.message,
           errorCode: error.code,
-          responseStatus: error.response?.status,
-          duration: `${duration}ms`
+          responseStatus: error.response?.status
         });
       }
 
@@ -244,11 +182,6 @@ class BackendService {
         mimeType: messageData.media.mimeType,
         filename: messageData.media.filename,
         filesize: messageData.media.filesize,
-        // NO incluir data (base64) por tamaño
-        hasData: !!messageData.media.data,
-        dataSize: messageData.media.data ? messageData.media.data.length : 0,
-        
-        // Metadata específica por tipo
         duration: messageData.media.duration || null,
         width: messageData.media.width || null,
         height: messageData.media.height || null,
@@ -263,7 +196,6 @@ class BackendService {
 
     return payload;
   }
-
 }
 
 module.exports = new BackendService();
